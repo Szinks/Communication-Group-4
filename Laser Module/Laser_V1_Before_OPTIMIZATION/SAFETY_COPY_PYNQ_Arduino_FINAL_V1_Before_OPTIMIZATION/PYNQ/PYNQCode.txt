@@ -1,0 +1,413 @@
+/* =============================================================================
+ * BEFORE OPTIMIZATION
+ * Group 4 — Laser Communication: Start UI (pages 1–3) + Comm debug (page 4)
+ * -----------------------------------------------------------------------------
+ *  RX (Arduino -> PYNQ): HARDWARE UART0 @9600, standard 8N1, NORMAL polarity.
+ *                        Message: timestamp,payload,pastdelay\n  (split on ',')
+ *  TX (PYNQ -> Arduino): INVERTED 8N1 UART, bit-banged on A0 (software). Same
+ *                        framing as the inbound UART but REVERSED polarity:
+ *                        idle LOW, START HIGH, 8 data bits LSB-first (each
+ *                        inverted), STOP LOW(idle). '\n'-terminated. Sends
+ *                        "timestamp,payload\n". Each byte carries START+STOP so
+ *                        the peer re-syncs per byte. Runs at BIT_PERIOD_MS ->
+ *                        the peer's decoder MUST use the same slow bit period.
+ *  N (BTN2) = universal EXIT.
+ * ===========================================================================*/
+
+#include <libpynq.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+// ---- Pins ----
+#define RX_PIN  IO_AR0          // Arduino TX -> here (page-2 detect + UART0 RX)
+#define TX_PIN  IO_A0           // bit-banged inverted reply -> Arduino RX
+
+#define BTN_Y  IO_BTN3
+#define BTN_N  IO_BTN2
+#define BTN_A  IO_BTN1
+#define LED_Y  IO_LD3
+#define LED_N  IO_LD2
+#define LED_A  IO_LD1
+
+// ---- Display geometry (enforced 240x240 safe area) ----
+#define DISPLAY_W   240
+#define DISPLAY_H   240
+#define FONT_W        8
+#define FONT_H       16
+#define MARGIN_X      5
+#define TITLE_Y      25
+
+// ---- Start-UI page layout ----
+#define BODY_Y0      55
+#define BODY_DY      20
+
+// ---- Comm-screen layout ----
+#define Y_RX_HDR   50
+#define Y_RX_TS    72
+#define Y_RX_PL    92
+#define Y_RX_BITS 112
+#define Y_TX_HDR  140
+#define Y_TX_TS   162
+#define Y_TX_PL   182
+#define Y_TX_BITS 202
+#define Y_FOOTER  222
+
+// ---- Timing ----
+#define LOOP_MS               30
+#define BLINK_MS             600
+#define DETECT_SAMPLE_MS       5
+#define DOT_UPDATE_MS        400
+#define REQUIRED_TRANSITIONS   4
+#define HOLD_MS             4000
+#define BIT_PERIOD_MS         10   // reply bit-bang period; Arduino RX decoder must match
+
+typedef enum { ANS_NONE = 0, ANS_Y, ANS_N, ANS_A } answer_t;
+typedef enum { PAGE1, PAGE2_CONNECT, PAGE3_READY, PAGE4_COMM } state_t;
+
+// ===================== shared helpers =====================
+static void safe_draw(display_t *d, FontxFile *font, int x, int y,
+                      const char *text, uint16_t color)
+{
+    if (y < 0 || y + FONT_H > DISPLAY_H) return;
+    if (x < 0) x = 0;
+    int max_chars = (DISPLAY_W - x) / FONT_W;
+    if (max_chars <= 0) return;
+
+    char buf[48];
+    int n = (int)strlen(text);
+    if (n > max_chars)            n = max_chars;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    memcpy(buf, text, n);
+    buf[n] = '\0';
+    displayDrawString(d, font, x, y, (uint8_t *)buf, color);
+}
+
+static void draw_centered(display_t *d, FontxFile *font, int y,
+                          const char *text, uint16_t color)
+{
+    int x = (DISPLAY_W - (int)strlen(text) * FONT_W) / 2;
+    safe_draw(d, font, x, y, text, color);
+}
+
+static bool pressed(int btn)          { return gpio_get_level(btn) == GPIO_LEVEL_HIGH; }
+static void set_led(int led, bool on) { gpio_set_level(led, on ? GPIO_LEVEL_HIGH : GPIO_LEVEL_LOW); }
+static void all_leds_off(void)        { set_led(LED_Y,false); set_led(LED_N,false); set_led(LED_A,false); }
+
+static void draw_exit_footer(display_t *d, FontxFile *font)
+{
+    safe_draw(d, font, MARGIN_X, Y_FOOTER, "EXIT (N)", RGB_WHITE);
+}
+
+// ===================== Start-UI drawing =====================
+static void draw_page_number(display_t *d, FontxFile *font, int page_no)
+{
+    char s[8];
+    snprintf(s, sizeof(s), "%d", page_no);
+    int x = DISPLAY_W - (int)strlen(s) * FONT_W - 2;
+    safe_draw(d, font, x, DISPLAY_H - FONT_H - 2, s, RGB_WHITE);
+}
+
+static void draw_page(display_t *d, FontxFile *font,
+                      const char *title, const char *body[], int n_body, int page_no)
+{
+    displayFillScreen(d, RGB_BLACK);
+    safe_draw(d, font, MARGIN_X, TITLE_Y, title, RGB_GREEN);
+    for (int i = 0; i < n_body; i++)
+        safe_draw(d, font, MARGIN_X, BODY_Y0 + i * BODY_DY, body[i], RGB_WHITE);
+    draw_exit_footer(d, font);
+    draw_page_number(d, font, page_no);
+}
+
+static answer_t wait_for_answer(bool allowY, bool allowA)
+{
+    bool blink_on = false;
+    uint32_t elapsed = 0;
+
+    for (;;)
+    {
+        int btn = 0, led = 0;
+        answer_t ans = ANS_NONE;
+
+        if      (pressed(BTN_N))           { ans = ANS_N; btn = BTN_N; led = LED_N; }
+        else if (allowY && pressed(BTN_Y)) { ans = ANS_Y; btn = BTN_Y; led = LED_Y; }
+        else if (allowA && pressed(BTN_A)) { ans = ANS_A; btn = BTN_A; led = LED_A; }
+
+        if (ans != ANS_NONE)
+        {
+            all_leds_off();
+            set_led(led, true);
+            while (pressed(btn)) sleep_msec(10);
+            set_led(led, false);
+            return ans;
+        }
+
+        if (elapsed >= BLINK_MS) { blink_on = !blink_on; elapsed = 0; }
+        set_led(LED_Y, allowY && blink_on);
+        set_led(LED_A, allowA && blink_on);
+        set_led(LED_N, blink_on);
+        sleep_msec(LOOP_MS);
+        elapsed += LOOP_MS;
+    }
+}
+
+static void draw_connecting(display_t *d, FontxFile *font, int dots)
+{
+    char line[16] = "Connecting";
+    for (int i = 0; i < 3; i++) line[10 + i] = (i < dots) ? '.' : ' ';
+    line[13] = '\0';
+
+    displayFillScreen(d, RGB_BLACK);
+    safe_draw(d, font, MARGIN_X, TITLE_Y, line, RGB_RED);
+    draw_exit_footer(d, font);
+    draw_page_number(d, font, 2);
+}
+
+static bool wait_for_signal(display_t *d, FontxFile *font)   // true = EXIT
+{
+    switchbox_set_pin(RX_PIN, SWB_UART0_RX);   // AR0 = UART RX
+    uart_reset_fifos(UART0);
+
+    int dots = 1;
+    uint32_t anim = 0, blink_t = 0;
+    bool blink_on = false;
+
+    all_leds_off();
+    draw_connecting(d, font, dots);
+
+    while (!uart_has_data(UART0))               // connected once a byte arrives
+    {
+        if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10); set_led(LED_N, false); return true; }
+
+        if (anim >= DOT_UPDATE_MS) { dots = (dots % 3) + 1; draw_connecting(d, font, dots); anim = 0; }
+        if (blink_t >= BLINK_MS)   { blink_on = !blink_on; set_led(LED_N, blink_on); blink_t = 0; }
+
+        sleep_msec(DETECT_SAMPLE_MS);
+        anim    += DETECT_SAMPLE_MS;
+        blink_t += DETECT_SAMPLE_MS;
+    }
+    set_led(LED_N, false);
+    return false;
+}
+
+// ===================== message parsing (split on ',') =====================
+static void copy_field(char *dst, int cap, const char *start, const char *end)
+{
+    while (start < end && *start == ' ') start++;       // tolerate optional space
+    int n = (int)(end - start);
+    if (n < 0) n = 0;
+    if (n > cap - 1) n = cap - 1;
+    memcpy(dst, start, n);
+    dst[n] = '\0';
+}
+
+static void split_fields(const char *msg, char *ts, int tc, char *pl, int pc, char *dl, int dc)
+{
+    const char *end = msg + strlen(msg);
+    const char *c1 = strchr(msg, ',');
+    const char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+
+    copy_field(ts, tc, msg, c1 ? c1 : end);
+    if (c1) copy_field(pl, pc, c1 + 1, c2 ? c2 : end); else pl[0] = '\0';
+    if (c2) copy_field(dl, dc, c2 + 1, end);           else dl[0] = '\0';
+}
+
+static void make_reply(const char *msg, char *reply, int cap)   // "timestamp,payload"
+{
+    const char *c1 = strchr(msg, ',');
+    const char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+    const char *end = c2 ? c2 : msg + strlen(msg);
+    int n = (int)(end - msg);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(reply, msg, n);
+    reply[n] = '\0';
+}
+
+// ===================== inverted 8N1 UART transmit (software) =================
+// Reversed-polarity UART: idle LOW, START HIGH, 8 data bits LSB-first (each
+// inverted), STOP LOW(=idle). Every byte carries its own START+STOP, so the
+// peer re-synchronises on each byte and there is no cumulative drift. The
+// string passed in already contains its '\n' terminator.
+static void uart_send_inverted(const char *s)
+{
+    gpio_set_level(TX_PIN, 0);                          // idle = LOW
+    sleep_msec(BIT_PERIOD_MS);
+
+    for (int i = 0; s[i] != '\0'; i++)
+    {
+        unsigned char ch = (unsigned char)s[i];
+        gpio_set_level(TX_PIN, 1);                      // START = HIGH (inverted start)
+        sleep_msec(BIT_PERIOD_MS);
+        for (int b = 0; b < 8; b++)                     // 8 data bits, LSB-first, inverted
+        {
+            int bit = (ch >> b) & 1;
+            gpio_set_level(TX_PIN, bit ? 0 : 1);
+            sleep_msec(BIT_PERIOD_MS);
+        }
+        gpio_set_level(TX_PIN, 0);                      // STOP = LOW (= idle)
+        sleep_msec(BIT_PERIOD_MS);
+    }
+    gpio_set_level(TX_PIN, 0);                          // remain idle LOW
+}
+
+// ===================== comm-screen drawing =====================
+static bool hold_or_exit(int ms)
+{
+    uint32_t blink_t = 0; bool on = false;
+    for (int t = 0; t < ms; t++)
+    {
+        if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10); set_led(LED_N, false); return true; }
+        if (++blink_t >= BLINK_MS) { on = !on; set_led(LED_N, on); blink_t = 0; }
+        sleep_msec(1);
+    }
+    return false;
+}
+
+static void draw_comm_screen(display_t *d, FontxFile *font,
+                             const char *ts, const char *pl, int last_delay,
+                             bool rx_active, bool tx_active)
+{
+    char line[48];
+    displayFillScreen(d, RGB_BLACK);
+
+    safe_draw(d, font, MARGIN_X, TITLE_Y, "Communication", RGB_GREEN);   // title only now
+
+    draw_centered(d, font, Y_RX_HDR, "Received Data:", RGB_RED);
+    snprintf(line, sizeof(line), "Timestamp: %s", ts);  safe_draw(d, font, MARGIN_X, Y_RX_TS, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Payload: %s", pl);    safe_draw(d, font, MARGIN_X, Y_RX_PL, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Bits: %s", rx_active ? "Data Bytes" : "Idle");
+    safe_draw(d, font, MARGIN_X, Y_RX_BITS, line, RGB_WHITE);
+
+    draw_centered(d, font, Y_TX_HDR, "Transmitted Data:", RGB_RED);
+    snprintf(line, sizeof(line), "Timestamp: %s", ts);  safe_draw(d, font, MARGIN_X, Y_TX_TS, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Payload: %s", pl);    safe_draw(d, font, MARGIN_X, Y_TX_PL, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Bits: %s", tx_active ? "Data Bytes" : "Idle");
+    safe_draw(d, font, MARGIN_X, Y_TX_BITS, line, RGB_WHITE);
+
+    // ---- bottom row:  EXIT (N)  |  Last Delay:NNNN  |  4 ----
+    draw_exit_footer(d, font);                                           // "EXIT (N)"  (left)
+    snprintf(line, sizeof(line), "Last Delay:%04d", last_delay);
+    safe_draw(d, font, 90, Y_FOOTER, line, RGB_WHITE);                   // centered between
+    safe_draw(d, font, DISPLAY_W - FONT_W - 2, Y_FOOTER, "4", RGB_WHITE);// "4"  (right)
+}
+
+// ===================== page 4 =====================
+void communication_screen(display_t *d, FontxFile *font)
+{
+    switchbox_set_pin(RX_PIN, SWB_UART0_RX);            // AR0 = hardware UART RX (9600 8N1)
+    switchbox_set_pin(TX_PIN, SWB_GPIO);               // A0  = GPIO bit-bang TX
+    gpio_set_direction(TX_PIN, GPIO_DIR_OUTPUT);
+    gpio_set_level(TX_PIN, 0);                          // inverted idle = LOW
+    uart_reset_fifos(UART0);
+
+    char msg[128]; int len = 0;
+    char ts[32] = "", pl[48] = "", dl[16] = "", reply[96];
+    int last_delay = 0;
+    uint32_t blink_t = 0; bool blink_on = false;
+
+    draw_comm_screen(d, font, ts, pl, last_delay, false, false);
+
+    for (;;)
+    {
+        if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10); set_led(LED_N, false); return; }
+        if (blink_t >= BLINK_MS) { blink_on = !blink_on; set_led(LED_N, blink_on); blink_t = 0; }
+
+        if (uart_has_data(UART0))
+        {
+            uint8_t c = uart_recv(UART0);               // normal UART, 9600 8N1
+
+            if (c == '\r') continue;
+            if (c == '\n')
+            {
+                if (len == 0) continue;
+                msg[len] = '\0';
+
+                split_fields(msg, ts, sizeof ts, pl, sizeof pl, dl, sizeof dl);
+                if (dl[0]) last_delay = atoi(dl);
+
+                make_reply(msg, reply, sizeof reply);
+                {
+                    size_t rl = strlen(reply);          // append the '\n' terminator
+                    if (rl < sizeof(reply) - 1) { reply[rl] = '\n'; reply[rl + 1] = '\0'; }
+                }
+                draw_comm_screen(d, font, ts, pl, last_delay, true, true);
+
+                uart_send_inverted(reply);              // inverted 8N1 UART reply
+
+                draw_comm_screen(d, font, ts, pl, last_delay, false, false);
+                if (hold_or_exit(HOLD_MS)) { set_led(LED_N, false); return; }
+
+                len = 0;
+            }
+            else
+            {
+                if (len == 0) draw_comm_screen(d, font, ts, pl, last_delay, true, false);
+                if (len < (int)sizeof(msg) - 1) msg[len++] = (char)c;
+            }
+        }
+        else
+        {
+            sleep_msec(1);
+            blink_t += 1;
+        }
+    }
+}
+
+// ===================== main =====================
+int main(void)
+{
+    pynq_init();
+    gpio_init();
+    uart_init(UART0);                 // hardware UART, 9600 8N1 (fixed in the bitstream)
+
+    display_t display;
+    display_init(&display);
+    FontxFile font[2];
+    InitFontx(font, "../../fonts/ILGH16XB.FNT", "");
+    displaySetFontDirection(&display, TEXT_DIRECTION0);
+
+    gpio_set_direction(BTN_Y, GPIO_DIR_INPUT);
+    gpio_set_direction(BTN_N, GPIO_DIR_INPUT);
+    gpio_set_direction(BTN_A, GPIO_DIR_INPUT);
+    gpio_set_direction(LED_Y, GPIO_DIR_OUTPUT);
+    gpio_set_direction(LED_N, GPIO_DIR_OUTPUT);
+    gpio_set_direction(LED_A, GPIO_DIR_OUTPUT);
+    all_leds_off();
+
+    state_t state = PAGE1;
+
+    for (;;)
+    {
+        if (state == PAGE1)
+        {
+            const char *body[] = { "Ready for Connection? (Y)" };
+            draw_page(&display, font, "Hello Universe.", body, 1, 1);
+            if (wait_for_answer(true, false) == ANS_Y) state = PAGE2_CONNECT;
+            else                                       state = PAGE1;
+        }
+        else if (state == PAGE2_CONNECT)
+        {
+            if (wait_for_signal(&display, font)) state = PAGE1;
+            else                                 state = PAGE3_READY;
+        }
+        else if (state == PAGE3_READY)
+        {
+            const char *body[] = { "Proceed to", "Communication? (Y/A)" };
+            draw_page(&display, font, "Ready for Communication", body, 2, 3);
+            answer_t a = wait_for_answer(true, true);
+            if      (a == ANS_Y) state = PAGE4_COMM;
+            else if (a == ANS_A) state = PAGE2_CONNECT;
+            else                 state = PAGE1;
+        }
+        else if (state == PAGE4_COMM)
+        {
+            communication_screen(&display, font);
+            state = PAGE1;
+        }
+    }
+
+    pynq_destroy();
+    return 0;
+}

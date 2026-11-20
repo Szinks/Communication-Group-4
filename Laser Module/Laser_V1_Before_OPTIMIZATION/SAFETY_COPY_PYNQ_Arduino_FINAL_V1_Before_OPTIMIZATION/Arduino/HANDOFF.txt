@@ -1,0 +1,548 @@
+================================================================================
+BEFORE OPTIMIZATION
+HANDOFF DOCUMENT
+UNO R4 WiFi  <->  PYNQ   ASYMMETRIC SERIAL LINK
+Scope: ARDUINO SIDE ONLY
+Date: 2026-11-19
+================================================================================
+
+--------------------------------------------------------------------------------
+0. OBJECTIVE
+--------------------------------------------------------------------------------
+The Arduino runs a round-trip verification + latency test against a PYNQ board.
+
+Each cycle it:
+  1. SENDS a known message out of D1 (fast hardware UART).
+  2. LISTENS on D2 for the PYNQ to echo part of that message back, encoded in a
+     slow, polarity-inverted, custom bit-banged format.
+  3. DECODES the reply to ASCII, undoing the polarity inversion.
+  4. COMPARES it byte-for-byte against what it expects.
+  5. MEASURES how long the round trip took, in milliseconds.
+  6. REPORTS match/mismatch on the onboard LED, and folds the measured latency
+     into the NEXT outgoing message as a third field.
+
+Why asymmetric: the Arduino can transmit at normal UART speed in hardware, but
+the PYNQ cannot bit-bang that fast, so the return path runs ~1000x slower and
+uses a custom frame the Arduino decodes in software.
+
+
+--------------------------------------------------------------------------------
+1. SETUP CONFIGURATION
+--------------------------------------------------------------------------------
+
+BOARD
+  Arduino UNO R4 WiFi (Renesas RA4M1).
+  ALL GPIO is 3.3 V logic. HIGH = 3.3 V, LOW = 0 V.
+  Pins are NOT 5 V tolerant on input.
+
+PIN ASSIGNMENT
+  D1   OUTPUT  Serial1 TX        -> data out to PYNQ UART RX
+  D0   (unused) Serial1 RX       -- claimed by Serial1.begin() but never read
+  D2   INPUT   bit-bang RX       <- data in from PYNQ, inverted + slow
+  D13  OUTPUT  LED_BUILTIN       -> match/mismatch status to the operator
+  USB-C        Serial (CDC)      -> debug text to a PC Serial Monitor
+
+  IMPORTANT: the receive pin is D2, NOT D0. Serial1.begin() takes ownership of
+  D0 and D1, so D0 cannot be read with digitalRead(). Any free GPIO works; D2
+  was chosen.
+
+WIRING
+  Arduino D1  ------------------> PYNQ UART RX
+  Arduino D2  <------------------ PYNQ bit-bang output
+  Arduino GND <-----------------> PYNQ GND          (MANDATORY)
+
+  No level shifter needed: both boards are 3.3 V logic.
+  Common ground is mandatory. Without it nothing decodes.
+
+  D2 is configured INPUT_PULLDOWN so that when the PYNQ is not driving it, the
+  pin reads LOW. LOW is the idle level for the inverted input format, so a
+  disconnected line looks like "idle", not like a START bit. If INPUT_PULLDOWN
+  is not honoured on your core, fit an external 10 kohm resistor from D2 to GND.
+
+POWER (standalone operation)
+  The sketch lives in flash and runs on power alone; no PC required.
+  Supply ONE of:
+    - USB-C from a phone charger / power bank (5 V), or
+    - regulated 5 V into the 5V pin, or
+    - 6-24 V into VIN (onboard regulator).
+  Do not feed 5 V into VIN (regulator dropout).
+  Do not connect two supplies at once.
+
+BAUD / TIMING CONFIGURATION AS CODED
+  Serial  (USB debug) .......... 115200 baud
+  Serial1 (D1, out to PYNQ) .... 9600 baud, 8N1   (fixed by the PYNQ bitstream)
+  D2 bit-bang (in from PYNQ) ... 10000 us/bit = 10 ms/bit (~100 baud)
+  Reply start timeout .......... 5000 ms
+  LED status window ............ 5000 ms per cycle
+
+MESSAGE CONSTANTS
+  TIMESTAMP = "1748765334567"      (13 chars)
+  PAYLOAD   = "ABCDEFAB"           (8 chars)
+
+
+--------------------------------------------------------------------------------
+2. ARDUINO OUTPUTS
+--------------------------------------------------------------------------------
+
+================================================================
+2.1  OUTPUT: D1  -  Serial1 TX  (the data the Arduino sends out)
+================================================================
+
+TRANSPORT
+  Hardware UART peripheral. The silicon generates the framing; software never
+  touches individual bits.
+
+ELECTRICAL / FRAMING  (standard UART, NOT inverted)
+  Idle level ......... HIGH (3.3 V)
+  START bit .......... LOW, 1 bit
+  Data ............... 8 bits, LSB-FIRST
+  Parity ............. none
+  STOP bit ........... HIGH, 1 bit
+  => 8N1, 10 bit times per character
+  Bit period ......... 1/9600 s = ~104.2 us as coded
+
+PAYLOAD FORMAT
+  timestamp,payload,pastdelay\n
+
+  - Fields separated by a single comma, NO space.
+  - Terminated by a single '\n' (0x0A).
+  - print('\n') is used, NOT println(), so NO carriage return is sent.
+  - All characters are plain 7-bit ASCII, transmitted in 8-bit frames.
+
+EXAMPLE, FIRST CYCLE
+  1748765334567,ABCDEFAB,0\n
+
+EXAMPLE, LATER CYCLE (after a reply measured ~2008 ms)
+  1748765334567,ABCDEFAB,2008\n
+
+FIELD MEANINGS
+  timestamp   fixed string, identifies the message
+  payload     fixed data string
+  pastdelay   round-trip latency in ms measured on the PREVIOUS cycle.
+              0 on the first message, and stays 0 until a reply is received.
+
+CADENCE
+  Emitted once per loop() iteration, immediately followed by Serial1.flush(),
+  which blocks until the UART has physically finished shifting the last bit.
+  This matters: print() is non-blocking and returns while D1 is still
+  transmitting. Without flush(), the receive routine would start sampling D2
+  while D1 was still toggling, and D1/D2 are adjacent header pins, so the
+  transmission can capacitively couple into D2 and be misread as a frame.
+
+================================================================
+2.2  OUTPUT: D13  -  LED_BUILTIN  (status to the operator)
+================================================================
+  Driven only by blinkStatus(), for 5000 ms at the end of every cycle.
+
+  MATCH    -> 125 ms half-period  -> 250 ms period  -> 4 blinks/second
+  MISMATCH -> 1000 ms half-period -> 2000 ms period -> 0.5 blinks/second
+              (the in-code comment says 1/s; see section 6)
+
+  "Mismatch" covers both a wrong reply AND no reply at all (timeout).
+
+  While receiveMessage() is waiting (up to 5000 ms), the LED is not driven, so
+  it sits at whatever blinkStatus() last left it (LOW/off). Visible behaviour
+  is therefore: a dark gap, then a 5 s blink burst, repeating.
+
+================================================================
+2.3  OUTPUT: USB  -  Serial debug
+================================================================
+  115200 baud, viewed in the Arduino IDE Serial Monitor.
+  One line per cycle:
+
+    n=<int> rx=[<received chars>] matched=<0|1>
+
+  n        number of characters decoded (0 = timeout / failure / runaway guard)
+  rx       the decoded ASCII string
+  matched  1 only if length AND content both match exactly
+
+  Serial (USB) and Serial1 (D1) are independent peripherals, so debugging on
+  USB does not disturb the PYNQ link.
+
+
+--------------------------------------------------------------------------------
+3. THE CODE
+--------------------------------------------------------------------------------
+
+================================================================
+3.1  BIG PICTURE
+================================================================
+Single-threaded, fully blocking, one state machine per loop() pass:
+
+   loop()
+     |
+     +-- 1. TRANSMIT  ....... Serial1.print(...) + flush()      [hardware]
+     |                        records sendTime = millis()
+     |
+     +-- 2. RECEIVE  ........ receiveMessage(rx, 64)            [software]
+     |                        blocks until a full frame set arrives
+     |                        or the 5 s start-timeout expires
+     |                        records recvTime = millis()
+     |
+     +-- 3. VERIFY  ......... length check + exact string compare
+     |                        pastDelay = recvTime - sendTime
+     |
+     +-- 4. REPORT  ......... Serial.print debug line
+     |
+     +-- 5. INDICATE  ....... blinkStatus(matched, 5000)
+                              (this also acts as the inter-cycle gap)
+
+There is no interrupt, no buffering, and no concurrency on the receive path.
+Transmit and receive never overlap in time.
+
+The only variable that survives between iterations is pastDelay.
+
+================================================================
+3.2  CONFIGURATION CONSTANTS
+================================================================
+  RX_PIN = 2            bit-bang input pin (D2)
+  LED_PIN = LED_BUILTIN status LED (D13)
+  RX_BIT_US = 10000     one bit period on the input, in microseconds
+  RX_TIMEOUT_MS = 5000  how long to wait for the reply to BEGIN
+  TIMESTAMP, PAYLOAD    the fixed message fields
+
+  Note RX_TIMEOUT_MS is a per-byte wait: it bounds how long receiveMessage()
+  waits for each byte's START edge, and is reset after every byte. The message
+  itself ends on '
+'; the overflow guard bounds a runaway.
+
+================================================================
+3.3  GLOBAL STATE
+================================================================
+  unsigned long pastDelay = 0;
+
+  The measured round-trip latency carried into the next outgoing message.
+  Initialised to 0, and only ever written inside the "if (n > 0)" branch, so it
+  remains 0 until the first reply is actually received. That is what makes the
+  first message's delay field 0, and keeps it 0 across failed cycles.
+
+================================================================
+3.4  FUNCTION: sampleLogical()
+================================================================
+  int sampleLogical()
+
+  INPUT   none (reads the global RX_PIN)
+  OUTPUT  int, 0 or 1 - the LOGICAL bit value
+
+  WHAT IT DOES
+    Reads D2 and returns the INVERSE of the raw pin level.
+
+      raw LOW  (0 V)   -> returns 1
+      raw HIGH (3.3 V) -> returns 0
+
+  WHY
+    This is the single point where the input's reversed polarity is undone.
+    Because every sample is inverted here, the rest of the decoder can be
+    written as if it were reading a normal, non-inverted frame:
+
+      logical 1 = idle / STOP
+      logical 0 = START
+      logical data bits = the true ASCII bits (8 of them, LSB-first)
+
+    Changing one line here flips the entire receive polarity.
+
+================================================================
+3.5  FUNCTION: receiveMessage()
+================================================================
+  int receiveMessage(char *buf, int maxLen)
+
+  INPUTS
+    buf     destination character array
+    maxLen  capacity of buf, including the null terminator
+  OUTPUT
+    int  number of characters written (buf is null-terminated, always), or
+         0 characters on timeout before any byte, or 0 on buffer overflow
+
+  A software INVERTED-UART receiver. One pass per byte, resyncing each time.
+
+  PER-BYTE STEP 1 - WAIT FOR IDLE
+    Waits until the line reads logical idle (1). The STOP bit of the previous
+    byte guarantees this, so it is immediate mid-message; for the first byte it
+    waits for the line to settle. Gives up after RX_TIMEOUT_MS of no activity.
+
+  PER-BYTE STEP 2 - DETECT A DEBOUNCED START
+    Polls for logical 0. On a candidate, waits RX_BIT_US/4 (2.5 ms) and re-reads.
+    If still 0, the START is real; waits a further RX_BIT_US/4 so execution sits
+    ~RX_BIT_US/2 into the START bit, i.e. at its CENTRE. A genuine START lasts
+    10 ms; noise spikes last microseconds, so the re-read rejects them.
+
+  PER-BYTE STEP 3 - READ THE BYTE
+    a) 8 times: delay one full bit period, then sample. Bits are assembled
+       LSB-FIRST via  if (sampleLogical()) c |= (1 << i)  with i = 0..7.
+    b) Delay one bit period to consume the STOP bit. This also leaves the line
+       at idle, ready for the next byte's START edge.
+    c) If the byte is '\n', the message is complete: terminate buf and return.
+    d) Otherwise store it (overflow guard returns 0 if buf is full), reset the
+       per-byte deadline, and loop.
+
+  WHY THIS DOES NOT DRIFT
+    Every byte ends in a STOP (idle) bit, so every START is a fresh logical
+    1->0 edge that step 2 locks onto. The decoder re-centres on each byte, so a
+    small bit-period mismatch between the two boards can only accumulate across
+    ONE byte (~10 bit times), never across the whole message. This is exactly
+    how an ordinary UART tolerates clock mismatch, rebuilt in software.
+
+================================================================
+3.6  FUNCTION: blinkStatus()
+================================================================
+  void blinkStatus(bool matched, unsigned long durationMs)
+
+  INPUTS
+    matched     selects the blink rate
+    durationMs  how long to keep blinking
+  OUTPUT
+    none; drives LED_PIN
+
+  WHAT IT DOES
+    Picks a half-period (125 ms if matched, 1000 ms if not), then toggles
+    LED_PIN HIGH/LOW with delay(half) between transitions until durationMs has
+    elapsed. Fully blocking, so it doubles as the gap between cycles.
+
+================================================================
+3.7  FUNCTION: setup()
+================================================================
+  Runs once at power-up or reset.
+
+    Serial.begin(115200)            USB debug port
+    Serial1.begin(9600)             hardware UART on D1/D0; claims both pins
+    pinMode(RX_PIN, INPUT_PULLDOWN) D2 as input, held LOW when undriven
+    pinMode(LED_PIN, OUTPUT)        LED drivable
+    digitalWrite(LED_PIN, LOW)      start with the LED off
+
+  Note there is NO pinMode for D0 or D1 - Serial1.begin() configures them.
+  There is also no "wait for Serial" loop, which is deliberate: the sketch must
+  run standalone on a charger with no PC attached.
+
+================================================================
+3.8  FUNCTION: loop()
+================================================================
+  STEP 1 - SEND
+    Records sendTime = millis(), then prints
+      TIMESTAMP ',' PAYLOAD ',' pastDelay '\n'
+    to Serial1, then calls Serial1.flush() to block until transmission is
+    physically complete before listening.
+
+  STEP 2 - RECEIVE
+    Declares char rx[64], calls receiveMessage(rx, sizeof(rx)) into n, then
+    records recvTime = millis().
+
+  STEP 3 - VERIFY AND MEASURE
+    matched defaults to false. Only if n > 0:
+      builds expected = TIMESTAMP + "," + PAYLOAD
+      matched = (n == expected.length()) AND (expected == String(rx))
+      pastDelay = recvTime - sendTime
+    On timeout the whole block is skipped: matched stays false and pastDelay is
+    left untouched.
+
+    The latency measured spans: start of transmission -> flush -> PYNQ turnaround
+    -> entire slow reception. It is therefore dominated by the slow return path.
+
+  STEP 4 - DEBUG
+    Prints n, rx and matched to the USB port.
+
+  STEP 5 - INDICATE
+    blinkStatus(matched, 5000). Blocks 5 s, which is also the inter-cycle idle.
+
+
+--------------------------------------------------------------------------------
+4. ARDUINO INPUT
+--------------------------------------------------------------------------------
+
+================================================================
+4.1  INPUT: D2  -  inverted 8N1 UART, bit-banged, slow
+================================================================
+
+TRANSPORT
+  No peripheral. Pure software sampling with digitalRead() and timed delays.
+
+ELECTRICAL / FRAMING AS SEEN ON THE WIRE  (INVERTED vs normal UART)
+  Idle level ......... LOW  (0 V)
+  START bit .......... HIGH, 1 bit
+  Data ............... 8 bits, LSB-FIRST, each bit INVERTED
+                       (a logical 1 appears on the wire as LOW)
+  STOP bit ........... LOW, 1 bit  (= idle level; the inverse of a UART stop)
+  => 10 bit times per character (1 START + 8 data + 1 STOP)
+  Bit period ......... 10 ms  (~100 baud)
+  Character time ..... 10 x 10 ms = 100 ms
+
+  This is the SAME framing as the outbound hardware UART (section 2.1), just
+  reversed in polarity and clocked slowly in software.
+
+AFTER sampleLogical() INVERSION, the decoder sees a normal UART:
+  idle = 1, START = 0, data = true bits (LSB first), STOP = 1
+
+PAYLOAD FORMAT
+  timestamp,payload\n
+
+  - Single comma separator, no space.
+  - '\n' TERMINATES the message, exactly like the outbound path.
+  - 8-bit frames (the data is 7-bit ASCII, carried in 8-bit bytes).
+
+EXPECTED CONTENT
+  1748765334567,ABCDEFAB      (22 characters, then '\n')
+
+TIMING CONSEQUENCE
+  23 chars x 100 ms = ~2300 ms, roughly 2.3 seconds to receive one reply.
+  pastDelay will therefore normally read ~2300 ms or more. That is inherent to
+  the slow return path, not a fault.
+
+INTER-CHARACTER BEHAVIOUR
+  Each byte ends in a STOP (idle) bit, so the line is briefly idle between
+  bytes and the next START is a clean logical 1->0 edge. The decoder RE-SYNCS
+  on that edge every byte rather than counting blindly from a single START.
+
+TOLERANCE
+  At 10 ms/bit the per-bit margin is large, and because the decoder re-syncs on
+  every byte's START edge, a small bit-period mismatch between the two boards
+  cannot accumulate past one byte. The cumulative drift that a single-START,
+  count-through decoder would suffer does not apply here.
+
+WHEN NOTHING IS CONNECTED
+  INPUT_PULLDOWN holds D2 LOW = logical idle. The idle wait passes immediately,
+  no START edge ever appears, RX_TIMEOUT_MS expires, receiveMessage returns 0,
+  matched stays false, and the LED shows the mismatch pattern. This is the
+  correct and expected behaviour with no PYNQ attached.
+
+
+--------------------------------------------------------------------------------
+5. WHAT BOTH ENDS MUST AGREE ON
+--------------------------------------------------------------------------------
+  OUTBOUND (D1 -> PYNQ)
+    - baud rate exactly (9600 as coded)
+    - 8N1, LSB-first, standard non-inverted polarity
+    - comma separator with no space
+    - '\n' terminator, no '\r'
+
+  INBOUND (PYNQ -> D2)
+    - bit period exactly 10 ms
+    - inverted polarity: idle LOW, START HIGH, data bits flipped, STOP LOW
+    - 8 data bits, LSB-FIRST
+    - '\n' terminates the message (no CONTROL bit)
+    - content exactly "timestamp,payload" with the same separator
+
+  BOTH
+    - 3.3 V logic
+    - common ground
+    - crossed wiring (each TX to the other's RX)
+
+
+--------------------------------------------------------------------------------
+6. KNOWN ISSUES / DISCREPANCIES IN THE CURRENT CODE
+--------------------------------------------------------------------------------
+  [1] No CRC or parity anywhere.
+      Integrity rests entirely on the exact string comparison. A corrupted
+      reply is reported as a mismatch, indistinguishable from a wrong reply.
+
+  [2] Framing depends on the '\n' terminator.
+      If the '\n' is lost, receiveMessage() keeps waiting for the next byte's
+      START until the per-byte RX_TIMEOUT_MS expires, then returns what it has.
+      The buffer-overflow guard also returns 0.
+
+  [3] No automatic retransmit.
+      A mismatched or missing reply is simply reported; the next loop() retries.
+
+  RESOLVED SINCE THE PRE-UART VERSION
+      - The old 7-bit MSB-first CONTROL-bit frame detected ONE START and then
+        counted ~198 bit periods to the end with no resync, so it drifted. The
+        per-byte START+STOP UART framing now resyncs on every byte.
+      - rx[] is now always null-terminated by receiveMessage(), so an n == 0
+        line prints rx=[] rather than stale bytes.
+      - The stale 115200 baud comments were corrected to 9600 (the rate the
+        PYNQ bitstream fixes), and the mismatch-blink comment to 0.5 blinks/s.
+
+
+--------------------------------------------------------------------------------
+7. REQUESTED MODIFICATIONS
+--------------------------------------------------------------------------------
+
+================================================================
+7.1  REMOVE THE DELAY, BOTH DISPLAYED AND RECEIVED
+================================================================
+GOAL
+  Stop sending the third field. Outgoing becomes "timestamp,payload\n", and the
+  latency is no longer measured or reported.
+
+CHANGES
+  a) Delete the global:
+       unsigned long pastDelay = 0;
+
+  b) In loop() step 1, delete the two prints that emit the third field:
+       Serial1.print(',');
+       Serial1.print(pastDelay);
+     leaving:
+       Serial1.print(TIMESTAMP); Serial1.print(',');
+       Serial1.print(PAYLOAD);   Serial1.print('\n');
+       Serial1.flush();
+
+  c) In loop() step 3, delete:
+       pastDelay = recvTime - sendTime;
+
+  d) Delete the now-unused timing variables:
+       unsigned long sendTime = millis();
+       unsigned long recvTime = millis();
+     (Keep them only if you still want latency on the USB debug line.)
+
+SIDE EFFECTS
+  - Outgoing and expected-incoming strings become IDENTICAL, so the single
+    String expected can be built once and reused for both.
+  - The PYNQ parser must stop expecting a third field.
+  - Nothing in receiveMessage() changes; the reply never carried a delay field.
+
+================================================================
+7.2  USE 7-BIT DATA BYTES
+================================================================
+RECEIVE SIDE
+  Now 8-bit, LSB-first. The decode loop reads 8 data bits:
+      for (int i = 0; i < 8; i++)
+  To go 7-bit, narrow it to 7 bits and have the PYNQ send 7 to match.
+
+TRANSMIT SIDE
+  Currently 8N1. To send 7 data bits, pass a config constant to begin():
+
+      Serial1.begin(9600, SERIAL_7N1);
+
+  Variants if parity is wanted:
+      SERIAL_7E1   7 data bits, even parity, 1 stop
+      SERIAL_7O1   7 data bits, odd parity,  1 stop
+
+CONSEQUENCES
+  - Safe for this data: every character used (digits, letters, comma, newline)
+    is below 0x80, so nothing is truncated.
+  - The PYNQ UART receiver MUST be reconfigured to 7 bits with the same parity
+    and stop setting, or every byte will be misframed.
+  - Any future payload byte >= 0x80 would silently lose its top bit.
+  - Frame length drops from 10 to 9 bit times per character, so the outbound
+    message transmits marginally faster. The D2 receive decoder would also need
+    narrowing to 7 data bits to match.
+
+================================================================
+7.3  IF THE INPUT HAD NO DELAY BETWEEN NEW DATA BYTES
+================================================================
+Both readings are now handled by the UART framing, so this is mostly historical.
+
+READING A - NO GAP BETWEEN CHARACTERS WITHIN A MESSAGE
+  SUPPORTED. Each byte has its own START and STOP, so bytes can follow with no
+  extra idle. The STOP bit is the one guaranteed idle bit, and the decoder
+  resyncs on the next START edge.
+
+READING B - NO IDLE BETWEEN MESSAGES
+  ALSO SUPPORTED, for the same reason. Every byte, including the first of a new
+  message, begins with a START edge off an idle STOP bit, so the decoder locks
+  onto each one independently. There is no 'stable idle for 5 ms' precondition
+  any more; the per-byte idle wait is satisfied by the previous STOP bit.
+
+  The message boundary is the '\n' byte: receiveMessage() returns when it
+  decodes '\n', and the next call starts cleanly on the next START. A sender
+  that streams messages back-to-back with no extra gap therefore works.
+
+  WHY THE OLD DRIFT RISK IS GONE
+    The pre-UART frame detected a single START and then counted ~198 bit
+    periods with no resync, so one slipped bit desynchronised the rest of the
+    message. The UART frame resyncs on every byte, so a lost or extra bit
+    corrupts at most that one byte; the following START edge re-aligns the
+    decoder. This is the standard reason asynchronous UART tolerates modest
+    clock mismatch.
+
+================================================================================
+END OF HANDOFF
+================================================================================

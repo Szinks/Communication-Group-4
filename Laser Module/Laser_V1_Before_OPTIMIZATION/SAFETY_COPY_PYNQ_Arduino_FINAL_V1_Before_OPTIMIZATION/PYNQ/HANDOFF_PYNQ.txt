@@ -1,0 +1,614 @@
+================================================================================
+BEFORE OPTIMIZATION 
+HANDOFF - PYNQ SIDE ONLY
+ Group 4 Laser Communication   |   folder: PYNQ_Arduino_V1
+ Course 5EWC0 - Programming and Engineering Challenge
+ Reference source: PYNQCode.txt  (commented twin: PYNQCode_Commented.txt)
+================================================================================
+
+0. SCOPE
+--------------------------------------------------------------------------------
+Everything below is written from the PYNQ's point of view only. The Arduino is
+treated as a black box that produces a voltage on one wire and consumes a
+voltage on another. Reading order is deliberately:
+
+        INPUTS OF THE PYNQ  ->  THE CODE  ->  OUTPUTS OF THE PYNQ
+
+Sections 1-3 are the big picture. Section 5 is the block-by-block walkthrough.
+Section 8 answers the three "what would I change if..." questions.
+
+
+1. SETUP / CONFIGURATION
+--------------------------------------------------------------------------------
+
+1.1 Hardware
+    - PYNQ-Z2 board, running the course Linux image with the libpynq bitstream.
+    - 2.4" SPI LCD on the board header. Usable drawing area is 240 x 240 px.
+    - On-board push buttons BTN1..BTN3 and LEDs LD1..LD3.
+    - Peer: Arduino UNO R4 WiFi (3.3 V logic, same as the PYNQ header).
+
+1.2 Wiring
+    Signal                     PYNQ pin   Direction   Peer pin
+    -------------------------  ---------  ----------  -----------------------
+    Serial data in             AR0        INPUT       Arduino D1 (Serial1 TX)
+    Custom inverted reply out  A0         OUTPUT      Arduino D2 (bit-bang in)
+    Ground                     GND        --          Arduino GND  (MANDATORY)
+
+    - A common ground is not optional. Without it the input pin floats and the
+      code reacts to mains hum (see section 9).
+    - A 10 kOhm pull-down on AR0 is recommended so the pin has a defined level
+      when the Arduino is unpowered or unplugged.
+    - PYNQ header pins are 3.3 V and are NOT 5 V tolerant. The R4 WiFi is
+      3.3 V, so this particular pairing is safe.
+
+1.3 Software / build
+    - Source lives on the board at:
+      /home/student/libpynq-5EWC0-2023-v0.2.6/applications/myleds/main.c
+    - Build and run from that folder:   make     then   ./main
+    - The project compiles with -Werror. A duplicated #define is a hard build
+      error, which matters when pasting blocks of this code together.
+    - Font file path is relative to the run directory:
+      ../../fonts/ILGH16XB.FNT  (8 x 16 px glyph cell).
+
+1.4 Fixed constraint you cannot configure away
+    The UART baud rate is baked into the FPGA bitstream at 9600 baud, 8N1.
+    uart_init(UART0) does not take a baud argument and there is no library call
+    to change it. Grepping the libpynq sources for "baud" finds nothing,
+    because the divider lives in hardware, not in C.
+
+    Consequence: the peer must transmit at exactly 9600 8N1. Any other rate
+    shows up as unprintable glyphs, "unstable" behaviour, or a program that
+    never leaves the Connecting page. The 9600 rate is stated in both source
+    files; earlier revisions had stale 115200 comments in PYNQCode.txt, now
+    corrected.
+
+
+2. OBJECTIVE AND HOW IT IS ACHIEVED
+--------------------------------------------------------------------------------
+
+Objective
+    Give the PYNQ a self-contained operator console for the laser link:
+    (a) walk the user through connecting, (b) prove a live link exists,
+    (c) show in human-readable form what was received and what was echoed back,
+    and (d) echo the message back to the peer over a second, deliberately
+    different physical protocol.
+
+How it is achieved
+    1. A 4-state state machine in main() drives four LCD pages. State changes
+       come only from button presses or from the arrival of serial data.
+    2. Link presence is proven by the hardware UART FIFO: the moment the
+       receiver latches one byte, the link is declared up. No analogue
+       threshold guessing, no edge counting.
+    3. Incoming bytes are accumulated into a line buffer until '\n'. The line
+       is then split on commas into timestamp / payload / pastdelay. These are
+       printed on the LCD as text.
+    4. The reply ("timestamp,payload\n", the delay field is deliberately not
+       echoed) is clocked out of A0 by software, one GPIO level per 10 ms, as
+       an inverted 8N1 UART frame that the peer's software decoder expects.
+    5. Every LCD write goes through one clipping wrapper so the program can
+       never be killed by an off-screen glyph.
+
+Design decision worth knowing
+    The link is ASYMMETRIC in speed and polarity, not framing. Inbound is
+    standard hardware UART; outbound is the SAME 8N1 UART framing, inverted and
+    bit-banged slowly in software. The inverted polarity still stops a hardware
+    UART receiver reading it directly; the reason is in section 6.1.
+
+
+3. BIG PICTURE
+--------------------------------------------------------------------------------
+
+   INPUTS                      PROCESSING                      OUTPUTS
+   ------------------------    ---------------------------     ----------------
+   AR0  serial 9600 8N1   -->  UART0 FIFO
+                               uart_recv() byte at a time
+                               accumulate until '\n'
+                               split_fields() on ','      -->  LCD text rows
+                               make_reply() first 2 fields
+                               uart_send_inverted()     -->  A0  inverted
+                                                               bit-banged frame
+   BTN1 / BTN2 / BTN3     -->  wait_for_answer()
+                               state machine in main()    -->  LCD page change
+                                                          -->  LD1 / LD2 / LD3
+
+   Page flow:
+       PAGE1  "Hello Universe."            -- Y  -> PAGE2
+       PAGE2  "Connecting..."              -- first RX byte -> PAGE3
+       PAGE3  "Ready for Communication"    -- Y  -> PAGE4 ,  A -> PAGE2
+       PAGE4  communication debug screen   -- N  -> PAGE1
+       N (BTN2) is a universal EXIT back to PAGE1 on every page.
+
+
+4. THE INPUTS OF THE PYNQ
+--------------------------------------------------------------------------------
+
+4.1 AR0 - the data input
+    Electrical      0 V = logic 0, 3.3 V = logic 1. The input buffer is
+                    LVCMOS33: below about 0.8 V reads as 0, above about 2.0 V
+                    reads as 1, and the band between them is undefined.
+    Routing         switchbox_set_pin(RX_PIN, SWB_UART0_RX) connects the
+                    physical pin to the UART0 receiver inside the FPGA.
+    Protocol        Standard UART, 9600 baud, 8 data bits, no parity, 1 stop
+                    bit, normal polarity (idle HIGH, start bit LOW).
+    Payload format  ASCII text, comma separated, newline terminated:
+                        timestamp,payload,pastdelay\n
+                    Example:   1748765334567,ABCDEFAB,0
+                    - timestamp : digits, sent as TEXT not as raw bytes
+                    - payload   : the data under test
+                    - pastdelay : round trip time in ms measured by the peer
+                                  for the PREVIOUS exchange. First message is 0.
+    Reading API     uart_has_data(UART0) -> bool,  uart_recv(UART0) -> uint8_t.
+                    The FIFO is what makes this robust: a whole 27 ms message
+                    can land while the main loop is asleep and nothing is lost.
+
+4.2 BTN1 / BTN2 / BTN3 - the user input
+    Role       Button   LED lit   Meaning
+    ---------  -------  --------  -----------------------------------------
+    Y          BTN3     LD3       accept / advance
+    A          BTN1     LD1       again / go back to Connecting
+    N          BTN2     LD2       universal EXIT to page 1
+    Read with gpio_get_level(pin) == GPIO_LEVEL_HIGH, polled, not interrupt
+    driven. There is no hardware debounce; the code instead waits for release
+    (while (pressed(btn)) sleep_msec(10)) which is enough in practice.
+
+4.3 Resources that behave like inputs
+    - The font file ../../fonts/ILGH16XB.FNT is loaded once by InitFontx().
+      If the working directory is wrong, text silently fails to render.
+
+
+5. THE CODE, BLOCK BY BLOCK
+--------------------------------------------------------------------------------
+
+5.1 Includes and #defines
+    Pin aliases (RX_PIN, TX_PIN, BTN_*, LED_*) so a rewire is a one-line edit.
+    Geometry block: DISPLAY_W = DISPLAY_H = 240, FONT_W = 8, FONT_H = 16. These
+    are the ENFORCED safe area found empirically, not a datasheet value.
+    Two layout blocks: BODY_Y0/BODY_DY for the simple pages, and the Y_RX_*/
+    Y_TX_*/Y_FOOTER row table for page 4.
+    Timing block: LOOP_MS 30 (button poll), BLINK_MS 600 (LED half period),
+    DETECT_SAMPLE_MS 5, DOT_UPDATE_MS 400, HOLD_MS 4000 (freeze after a
+    message), BIT_PERIOD_MS 10 (outbound bit time).
+    REQUIRED_TRANSITIONS is left over from the abandoned edge-counting
+    detector and is now unused - safe to delete.
+
+5.2 Types
+    answer_t  = ANS_NONE | ANS_Y | ANS_N | ANS_A  -- what a button press means
+    state_t   = PAGE1 | PAGE2_CONNECT | PAGE3_READY | PAGE4_COMM  -- the page
+
+5.3 safe_draw()   -- the single most important function in the file
+    In : display, font, x, y, text, colour.      Out: nothing (void).
+    Does: rejects the row entirely if it would fall off the bottom, clamps a
+    negative x to 0, computes how many 8-px glyphs still fit to the right of x,
+    truncates the string into a 48-byte local buffer, and only then calls
+    displayDrawString. Rationale: libpynq's displayDrawChar calls abort() on an
+    out-of-bounds glyph, which kills the whole process. Nothing in this file
+    may call displayDrawString directly.
+
+5.4 draw_centered()
+    In : y, text, colour.   Out: void.
+    Computes x = (240 - len*8)/2 and forwards to safe_draw. Used for the two
+    red section headers on page 4.
+
+5.5 pressed() / set_led() / all_leds_off()
+    pressed(btn)      -> bool, true while the button is held.
+    set_led(led, on)  -> void, drives one LED.
+    all_leds_off()    -> void, clears all three. Called before lighting one so
+                         two LEDs can never be on at once.
+
+5.6 draw_exit_footer() / draw_page_number() / draw_page()
+    draw_exit_footer  writes "EXIT (N)" at the bottom left. Called by every
+                      page, which is what makes the exit hint universal.
+    draw_page_number  renders the page digit flush to the bottom right by
+                      measuring the string and subtracting from DISPLAY_W.
+    draw_page(title, body[], n_body, page_no)
+        In : a green title string, an array of white body lines, how many, and
+             the page number.    Out: void.
+        Does: clear to black, title at TITLE_Y, body lines at BODY_Y0 + i*20,
+        then the footer and the page number. Pages 1 and 3 are only data
+        passed into this one function, which is why they have no code of
+        their own.
+
+5.7 wait_for_answer(allowY, allowA)
+    In : two booleans saying which options are offered.   Out: answer_t.
+    Does: blocks in a 30 ms poll loop. N is always accepted. On a press it
+    turns every LED off, lights the one belonging to that answer SOLID, waits
+    for release, clears it, and returns. While nothing is pressed, the LEDs of
+    the OFFERED options blink together every 600 ms. So: blinking = waiting for
+    you, solid = your press is registered.
+
+5.8 draw_connecting() / wait_for_signal()
+    draw_connecting(dots)   redraws page 2 with "Connecting" plus 1, 2 or 3
+                            dots in RED, padded to a fixed width so the text
+                            does not jitter, plus footer and page number.
+    wait_for_signal()
+        In : display, font.      Out: bool - true means the user pressed EXIT.
+        Does: routes AR0 to the UART receiver, clears the FIFO so stale bytes
+        cannot cause a false positive, then loops on while(!uart_has_data).
+        Inside the loop it animates the dots every 400 ms, blinks LD2 every
+        600 ms, checks BTN2, and sleeps 5 ms. It exits the loop the instant
+        ONE byte exists in the FIFO - that is the definition of "connected"
+        in this program.
+
+5.9 copy_field() / split_fields() / make_reply()
+    copy_field(dst, cap, start, end)
+        Out: void. Copies the half-open range [start,end) into dst, skipping
+        leading spaces, clamping to cap-1, and NUL terminating. Capacity
+        clamping here is what prevents buffer overruns everywhere else.
+    split_fields(msg, ts,tc, pl,pc, dl,dc)
+        Out: void, three strings filled by reference.
+        Finds the 1st comma, then the 2nd comma after it. Field 1 is start..c1,
+        field 2 is c1+1..c2, field 3 is c2+1..end. Missing commas are not an
+        error: the absent fields simply come back as empty strings.
+    make_reply(msg, reply, cap)
+        Out: void, reply filled.
+        Copies the raw message from byte 0 up to the SECOND comma, i.e.
+        "timestamp,payload" exactly as received, with the delay field dropped.
+        Working on the raw string rather than re-joining the parsed fields
+        guarantees the echo is byte identical to what arrived.
+
+5.10 uart_send_inverted(s)
+    In : the C string to transmit (already '\n'-terminated).   Out: void.
+    Side effect: drives A0.
+    Does: holds A0 at the inverted idle (LOW) for one bit, then for each byte
+    emits START (HIGH), 8 data bits LSB first with every bit INVERTED, and a
+    STOP bit (LOW = idle). Each level is held by sleep_msec(10). Every byte
+    carries its own START+STOP, so the peer re-syncs per byte (no drift).
+    Blocking and timing critical: it is why the LCD and the exit LED freeze for
+    roughly 2.3 s while a reply is going out.
+
+5.11 hold_or_exit(ms)
+    In : how many milliseconds to freeze.   Out: bool - true if EXIT pressed.
+    Does: a 1 ms granularity loop that keeps the current screen on display for
+    ms milliseconds while still polling BTN2 and blinking LD2. This is what
+    implements the "a finished message stays readable for 4 s" requirement.
+    Note it does NOT read the UART while holding - see section 8.3.
+
+5.12 draw_comm_screen(ts, pl, last_delay, rx_active, tx_active)
+    In : the two parsed strings, the delay as an int, and two booleans saying
+         whether each direction is currently moving data.   Out: void.
+    Does: clears the screen and lays out page 4 top to bottom:
+        green  "Communication"                     TITLE_Y   25
+        red    "Received Data:"      centred       Y_RX_HDR  50
+        white  "Timestamp: ..."                    Y_RX_TS   72
+        white  "Payload: ..."                      Y_RX_PL   92
+        white  "Bits: Data Bytes" or "Bits: Idle"  Y_RX_BITS 112
+        red    "Transmitted Data:"   centred       Y_TX_HDR  140
+        white  "Timestamp: ..."                    Y_TX_TS   162
+        white  "Payload: ..."                      Y_TX_PL   182
+        white  "Bits: ..."                         Y_TX_BITS 202
+        bottom row at Y_FOOTER 222:
+            "EXIT (N)"          at x = MARGIN_X
+            "Last Delay:NNNN"   at x = 90   (%04d, 4 digits, milliseconds)
+            "4"                 flush right
+    The transmitted rows deliberately show the same ts and pl as the received
+    rows, because the reply is a verbatim echo of those two fields.
+
+5.13 communication_screen() - page 4, the heart of the program
+    In : display, font.   Out: void. Returns only when EXIT is pressed.
+    Setup: AR0 -> UART0 receiver; A0 -> plain GPIO, output, driven LOW
+    (the inverted idle); FIFOs cleared; buffers zeroed; screen drawn idle.
+    Loop, in priority order:
+        1. BTN2 held -> wait for release, clear LD2, return (back to page 1).
+        2. 600 ms elapsed -> toggle LD2 so the exit hint stays alive.
+        3. uart_has_data -> uart_recv one byte:
+             '\r'                 : ignored, so CRLF and LF both work.
+             '\n'                 : end of message. Terminate the buffer,
+                                    split_fields, store atoi(delay) if present,
+                                    make_reply, redraw with both directions
+                                    ACTIVE, call uart_send_inverted (about
+                                    2 s of blocking), redraw as IDLE, then
+                                    hold_or_exit(4000), then reset len to 0.
+             any other byte       : if it is the first byte of a new message,
+                                    redraw with RX active so "Bits: Data Bytes"
+                                    appears; then append to msg[] with an
+                                    overflow guard.
+        4. nothing to do -> sleep 1 ms and advance the blink counter.
+    So the screen is refreshed only on events, never on a timer.
+
+5.14 main()
+    Does, in order: pynq_init, gpio_init, uart_init(UART0); display_init,
+    InitFontx, displaySetFontDirection; set the three buttons as inputs and
+    the three LEDs as outputs; all LEDs off; then an infinite state machine:
+        PAGE1          draw_page("Hello Universe.", {"Ready for Connection? (Y)"})
+                       then wait_for_answer(Y only). Y -> PAGE2, anything else
+                       stays on PAGE1.
+        PAGE2_CONNECT  wait_for_signal(). EXIT -> PAGE1, data seen -> PAGE3.
+        PAGE3_READY    draw_page("Ready for Communication", {"Proceed to",
+                       "Communication? (Y/A)"}) then wait_for_answer(Y and A).
+                       Y -> PAGE4, A -> PAGE2, N -> PAGE1.
+        PAGE4_COMM     communication_screen(), and on return -> PAGE1.
+    The pynq_destroy() at the end is unreachable because the loop never breaks;
+    it is kept as documentation of the intended teardown.
+
+5.15 Function reference - inputs and outputs at a glance
+    name                     inputs                              returns
+    -----------------------  ----------------------------------  --------------
+    safe_draw                d, font, x, y, text, colour         void
+    draw_centered            d, font, y, text, colour            void
+    pressed                  button pin                          bool
+    set_led                  led pin, on/off                     void
+    all_leds_off             -                                   void
+    draw_exit_footer         d, font                             void
+    draw_page_number         d, font, page_no                    void
+    draw_page                d, font, title, body[], n, page_no  void
+    wait_for_answer          allowY, allowA                      answer_t
+    draw_connecting          d, font, dots                       void
+    wait_for_signal          d, font                             bool (EXIT?)
+    copy_field               dst, cap, start, end                void
+    split_fields             msg + 3 (buf,cap) pairs             void
+    make_reply               msg, reply, cap                     void
+    uart_send_inverted     string                              void (drives A0)
+    hold_or_exit             ms                                  bool (EXIT?)
+    draw_comm_screen         d, font, ts, pl, delay, rx, tx      void
+    communication_screen     d, font                             void
+    main                     -                                   int (never)
+
+
+6. THE OUTPUTS OF THE PYNQ
+--------------------------------------------------------------------------------
+
+6.1 A0 - the data output (inverted 8N1 UART, bit-banged)
+    Electrical  push-pull GPIO, 0 V or 3.3 V.
+    Idle level  LOW. This is the inverse of UART, whose idle is HIGH.
+    Bit time    BIT_PERIOD_MS = 10 ms, i.e. about 100 bit/s.
+    Frame       10 bits per character (the inbound UART frame, inverted):
+                  bit 1     START   = HIGH
+                  bits 2-9  8 data bits, LSB first, each one INVERTED
+                  bit 10    STOP    = LOW (= idle level)
+    Content     "timestamp,payload\n". The '\n' byte ends the message, exactly
+                like the inbound path.
+
+    Worked example, the character 'A':
+        ASCII 'A' = 0x41 = bits 0100 0001; LSB first = 1,0,0,0,0,0,1,0
+        sent as  START=HIGH, then those 8 bits with every level flipped,
+        then STOP=LOW.
+
+    Why a hardware UART still cannot read it, for the record:
+        - The whole line is inverted, so a normal UART receiver sees the idle
+          LOW as a permanent break condition and never frames anything.
+        An external inverter on the line, or a UART core told to expect
+        inverted signalling, could read it; the peer instead decodes it in
+        software, inverting every sample. That is deliberate: idle LOW matches
+        the peer's D2 pulldown, so an unplugged line reads as idle.
+
+    Why 10 ms and not something fast: the PYNQ runs Linux. sleep_msec has 1 ms
+    resolution and the scheduler can preempt the process for far longer than
+    one bit time at any real baud rate. Only millisecond-scale bit periods are
+    reliable from userspace. A genuinely fast outbound link would have to be
+    implemented in the FPGA fabric.
+
+6.2 LCD - the human output
+    240 x 240 safe area, 8 x 16 font, so about 30 characters per row and
+    14 usable rows. Every write is clipped by safe_draw. Colours in use:
+    RGB_GREEN for titles, RGB_RED for the Connecting animation and the two
+    page-4 section headers, RGB_WHITE for data and footers, RGB_BLACK as the
+    background.
+
+6.3 LEDs - the status output
+    LD3/LD1  blink while Y/A are being offered, solid while held.
+    LD2      blinks on pages 2 and 4 as a live "EXIT is available" sign, and
+             goes solid for as long as BTN2 is held.
+    Known limitation: LD2 stops blinking during the roughly 2 s bit-bang
+    transmission, because nothing may interrupt the bit timing.
+
+
+7. TIMING BUDGET
+--------------------------------------------------------------------------------
+    inbound message, 25-28 chars at 9600 8N1    about 26-29 ms
+    outbound reply, 23 chars x 10 bits x 10 ms  about 2300 ms
+    on-screen freeze after a message, HOLD_MS          4000 ms
+    peer's listen timeout for the reply                5000 ms
+    peer's idle before it resends                      5000 ms
+
+    Two constraints must hold:
+      the 2 s reply must fit inside the peer's 5 s listen window, and
+      the PYNQ must be back at the top of its loop (after the 4 s hold) before
+      the peer sends the next message.
+    It fits, but the margin is thin. If the peer reports a timeout or an empty
+    receive, lengthen its timeout and its idle rather than shortening HOLD_MS.
+
+
+8. MODIFICATIONS
+--------------------------------------------------------------------------------
+
+8.1 REMOVE the delay, both displayed and received
+    Goal: the PYNQ no longer shows "Last Delay" and no longer expects a third
+    field. Inbound becomes "timestamp,payload\n".
+
+    Edits, all inside PYNQCode.txt:
+
+    (a) draw_comm_screen - drop the parameter and the two lines that print it:
+            -  ... int last_delay, bool rx_active, bool tx_active)
+            +  ... bool rx_active, bool tx_active)
+        and delete
+            snprintf(line, sizeof(line), "Last Delay:%04d", last_delay);
+            safe_draw(d, font, 90, Y_FOOTER, line, RGB_WHITE);
+        The bottom row then holds only "EXIT (N)" and the page number.
+
+    (b) communication_screen - delete the variable and the parse of it:
+            delete   int last_delay = 0;
+            delete   char dl[16] = "";
+            delete   if (dl[0]) last_delay = atoi(dl);
+        and update all four draw_comm_screen calls to the new signature.
+
+    (c) split_fields - either keep it and pass a dummy third buffer, or reduce
+        it to two fields. The two-field version:
+
+            static void split_two(const char *msg, char *ts, int tc,
+                                                   char *pl, int pc)
+            {
+                const char *end = msg + strlen(msg);
+                const char *c1  = strchr(msg, ',');
+                copy_field(ts, tc, msg, c1 ? c1 : end);
+                if (c1) copy_field(pl, pc, c1 + 1, end); else pl[0] = '\0';
+            }
+
+    (d) make_reply needs NO change. It copies up to the second comma, and when
+        there is no second comma it copies to the end of the string, which is
+        already "timestamp,payload".
+
+    (e) #include <stdlib.h> can be removed once atoi is gone.
+
+    (f) Nothing in pages 1-3, in the bit-bang transmitter or in the UART setup
+        is affected. The change is purely cosmetic plus one parse step.
+
+    Peer-side note, for completeness only: it must stop appending the third
+    field. If it keeps sending it, the PYNQ simply ignores the extra text, so
+    the two sides can be changed in either order without breaking the link.
+
+
+8.2 HAVE 7-BIT DATA BYTES
+    Two separate directions, and only one of them needs anything:
+
+    (a) OUTBOUND on A0 is now 8 data bits, LSB first. uart_send_inverted loops
+        for (int b = 0; b < 8; b++). To send 7 bits, narrow that loop and have
+        the peer's decoder read 7 bits to match.
+
+    (b) INBOUND on AR0 is the real question, and the honest answer is that the
+        receiver's frame width is fixed in the FPGA bitstream at 8N1. There is
+        no libpynq call to switch UART0 to 7 data bits. So you cannot change
+        the hardware frame from C; you can only make the SOFTWARE treat the
+        data as 7 bits. One line does that, right after the byte is read in
+        communication_screen:
+
+            uint8_t c = uart_recv(UART0);
+            c &= 0x7F;                 // keep 7 data bits, drop bit 7
+
+        What this actually buys you, case by case:
+          - Peer sends 8N1 with ASCII text: masking is a no-op for real ASCII
+            and a safety net against a stray high bit. Harmless and recommended.
+          - Peer sends 7E1 or 7O1 (7 data bits + parity + stop): the 8N1
+            receiver reads the 7 data bits plus the parity bit as bit 7, and
+            the real stop bit is HIGH so framing still succeeds. c &= 0x7F
+            discards the parity and recovers the character correctly. Parity is
+            not checked, only thrown away.
+          - Peer sends 7N1 (7 data bits + 1 stop, no parity): the 8N1 receiver
+            swallows the stop bit as bit 7, then needs the NEXT line level to
+            be HIGH to accept the frame. That works only if the peer leaves at
+            least one idle bit between characters. Back-to-back 7N1 characters
+            put a LOW start bit where the stop bit is expected and every frame
+            fails. 7N1 is therefore only safe with a gap, and 7E1/7O1 or
+            7N2 are the robust choices.
+
+    (c) If you truly need a 7-bit hardware receiver, the only route is to
+        rebuild the bitstream with the UART core configured for 7 data bits,
+        or abandon the hardware UART and bit-bang AR0 as GPIO in software,
+        which caps the usable rate at a few hundred baud (same userspace
+        timing limit as section 6.1).
+
+
+8.3 IF THE INPUT HAD NO DELAY BETWEEN SENDING NEW DATA BYTES
+    "No delay" has two meanings. Handle them separately.
+
+    CASE A - no gap between characters inside a message (gapless bytes).
+    Standard UART already allows this: the stop bit is the only mandated gap,
+    and the FIFO absorbs a continuous burst. Nothing to change, PROVIDED each
+    frame still ends with a HIGH stop bit. If the peer switches to a custom
+    gapless frame with no HIGH stop bit, then the hardware UART cannot be used
+    at all and AR0 has to be read as GPIO with a software decoder, inheriting
+    the few-hundred-baud ceiling.
+
+    CASE B - no idle time between messages (a continuous stream of lines).
+    This is what actually breaks the current code, and the reason is simple
+    arithmetic: after every '\n' the program spends about 2 s inside
+    uart_send_inverted and then 4 s inside hold_or_exit, and during those
+    6 s it never calls uart_recv. The UART FIFO is only tens of bytes deep,
+    so everything arriving in that window is lost or truncated. Fixes, in the
+    order I would apply them:
+
+    1. Keep '\n' framing. It is already delimiter based, so a partially
+       received line is harmless; only the discarded bytes matter.
+
+    2. Drain the FIFO WHILE holding. Replace the blocking hold with one that
+       keeps receiving. Sketch, to drop in next to hold_or_exit:
+
+            // returns true if EXIT pressed; keeps buffering UART during the hold
+            static bool hold_and_drain(int ms, char *msg, int *len, int cap)
+            {
+                uint32_t blink_t = 0; bool on = false;
+                for (int t = 0; t < ms; t++)
+                {
+                    if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10);
+                                          set_led(LED_N, false); return true; }
+                    while (uart_has_data(UART0))
+                    {
+                        uint8_t c = uart_recv(UART0);
+                        if (c == '\r') continue;
+                        if (*len < cap - 1) msg[(*len)++] = (char)c;
+                    }
+                    if (++blink_t >= BLINK_MS) { on = !on; set_led(LED_N, on);
+                                                 blink_t = 0; }
+                    sleep_msec(1);
+                }
+                return false;
+            }
+
+       Then, after the hold, scan the buffer for the LAST complete line and
+       display that, discarding the older ones. That keeps the display honest
+       ("this is the newest message") instead of falling further behind.
+
+    3. Make the freeze non-blocking. Instead of sitting in a hold, record
+       when the last message was drawn and refuse to redraw until HOLD_MS has
+       passed, while the receive loop keeps running every iteration:
+
+            uint32_t since_draw = 0;        // advanced by the loop's sleep
+            ...
+            if (message_complete && since_draw >= HOLD_MS)
+            { draw_comm_screen(...); since_draw = 0; }
+
+       The 4 s requirement is then "the screen does not change more often than
+       every 4 s", which is the readable behaviour that was actually wanted,
+       rather than "the program is deaf for 4 s".
+
+    4. Accept that the reply rate is the hard limit. uart_send_inverted
+       takes about 2.3 s and cannot be interrupted. If messages arrive closer
+       together than that, you cannot reply to each one. Choose one of:
+         - reply only to every Nth message, or only when the previous reply
+           finished, and show the rest as receive-only;
+         - shorten BIT_PERIOD_MS, remembering that below roughly 2-5 ms the
+           Linux scheduler starts corrupting the waveform and the peer's
+           decoder must be changed to match exactly;
+         - move the outbound protocol into the FPGA, which is the only real
+           fix.
+
+    5. Call uart_reset_fifos ONLY at entry to communication_screen. Calling it
+       mid-stream in a gapless scenario throws away valid buffered bytes.
+
+    6. Guard the line buffer. Today, if '\n' never arrives, len saturates at
+       127 and the message is never processed, so the program silently stops
+       updating. Add a resync:
+
+            if (len >= (int)sizeof(msg) - 1) { len = 0; /* drop and resync */ }
+
+
+9. KNOWN TRAPS - do not re-learn these the hard way
+--------------------------------------------------------------------------------
+ 1. displayDrawChar calls abort() on an off-screen glyph and kills the process.
+    Always go through safe_draw.
+ 2. The drawable area is 240 x 240, found by experiment. Do not assume 320x240.
+ 3. displayDrawString is not printf. It ignores %d and %s. snprintf first.
+ 4. A floating input pin is an antenna. Touching the bare wire, or just moving
+    the peer board nearer, coupled mains hum into AR0 and faked a connection.
+    Common ground plus a 10 kOhm pull-down.
+ 5. PYNQ header pins are 3.3 V and not 5 V tolerant.
+ 6. Detecting the link by counting GPIO edges does not work: a 27 ms burst
+    every few seconds is invisible to a 5 ms poll. Use uart_has_data, the FIFO
+    catches it regardless of how slowly you poll.
+ 7. The UART baud is 9600, fixed in the bitstream, not settable in C. This one
+    fact explains unprintable glyphs, instability, and a permanent
+    "Connecting..." all at once.
+ 8. Timestamps must arrive as ASCII text, never as raw binary, or they render
+    as unknown glyphs.
+ 9. No LCD or LED activity is allowed during a bit-banged transmission; an LCD
+    write takes milliseconds and destroys the bit timing.
+10. The build uses -Werror, so a duplicated #define is a hard error when
+    merging code blocks.
+11. REQUIRED_TRANSITIONS is dead code from the old detector.
+12. The outbound frame is now inverted 8N1 UART ('\n'-terminated), not the old
+    7-bit MSB-first CONTROL-bit frame. Each byte carries START+STOP, so the
+    peer re-syncs per byte and the slow link does not drift. (Earlier revisions
+    documented the custom frame and a stale 115200 baud comment; both gone.)
+
+================================================================================
+ END OF HANDOFF
+================================================================================

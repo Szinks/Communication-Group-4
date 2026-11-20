@@ -1,0 +1,108 @@
+// ============================================================
+//  BEFORE OPTIMIZATION
+//  UNO R4 WiFi <-> PYNQ   UART both ways, same framing, differing polarity
+//  TX (to PYNQ):   hardware UART Serial1, 9600, 8N1, NORMAL polarity
+//                  "timestamp,payload,pastdelay\n"
+//  RX (from PYNQ): INVERTED 8N1 UART, bit-banged on D2, 10 ms/bit (~100 baud)
+//                  idle LOW, START HIGH, 8 data bits LSB-first (each flipped),
+//                  STOP LOW(idle) ; '\n' terminates ; content "timestamp,payload"
+// ============================================================
+
+const int RX_PIN  = 2;             // D2 bit-bang input (Serial1 owns D0/D1)
+const int LED_PIN = LED_BUILTIN;
+
+const unsigned long RX_BIT_US     = 10000;  // 10 ms/bit (~100 baud)
+const unsigned long RX_TIMEOUT_MS = 5000;   // wait for the reply to start
+
+const char* TIMESTAMP = "1748765334567";
+const char* PAYLOAD   = "ABCDEFAB";
+
+unsigned long pastDelay = 0;
+
+int sampleLogical() { return !digitalRead(RX_PIN); } // invert: idle=1, START=0
+
+int receiveMessage(char *buf, int maxLen) {
+  // Inverted 8N1 UART receiver. After sampleLogical() inverts, the decoder
+  // sees a NORMAL frame: idle 1, START 0, 8 data bits LSB-first, STOP 1.
+  // Every byte ends in a STOP (idle) bit, so each START is a fresh 1->0 edge
+  // and the decoder RE-SYNCS on every byte -> no cumulative drift. The line
+  // ends at '\n'.
+  int idx = 0;
+  unsigned long deadline = millis() + RX_TIMEOUT_MS;
+
+  for (;;) {
+    // 1. wait for idle (logical 1) so we lock onto a real START edge
+    while (sampleLogical() != 1) {
+      if ((long)(millis() - deadline) >= 0) { buf[idx] = '\0'; return idx; }
+    }
+    // 2. wait for a DEBOUNCED START (logical 0) and centre on it
+    bool started = false;
+    while ((long)(millis() - deadline) < 0) {
+      if (sampleLogical() == 0) {
+        delayMicroseconds(RX_BIT_US / 4);
+        if (sampleLogical() == 0) { delayMicroseconds(RX_BIT_US / 4); started = true; break; }
+      }
+    }
+    if (!started) { buf[idx] = '\0'; return idx; }
+    // 3. 8 data bits, LSB-first
+    char c = 0;
+    for (int i = 0; i < 8; i++) {
+      delayMicroseconds(RX_BIT_US);
+      if (sampleLogical()) c |= (1 << i);
+    }
+    // 4. consume the STOP bit (leaves the line at idle for the next edge)
+    delayMicroseconds(RX_BIT_US);
+    // 5. '\n' ends the message and is not stored
+    if (c == '\n') { buf[idx] = '\0'; return idx; }
+    if (idx >= maxLen - 1) { buf[idx] = '\0'; return 0; }   // overflow guard
+    buf[idx++] = c;
+    deadline = millis() + RX_TIMEOUT_MS;                    // reset per byte
+  }
+}
+
+void blinkStatus(bool matched, unsigned long durationMs) {
+  unsigned long half = matched ? 125 : 1000;  // 125ms=4/s MATCH, 1000ms=0.5/s MISMATCH
+  unsigned long t0 = millis();
+  while (millis() - t0 < durationMs) {
+    digitalWrite(LED_PIN, HIGH); delay(half);
+    digitalWrite(LED_PIN, LOW);  delay(half);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);                      // USB debug
+  Serial1.begin(9600);                     // fast UART out (D1=TX)
+  pinMode(RX_PIN, INPUT_PULLDOWN);           // hold D2 LOW when undriven
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void loop() {
+  // 1. send, and FLUSH so TX fully finishes before we listen (no coupling into D2)
+  unsigned long sendTime = millis();
+  Serial1.print(TIMESTAMP); Serial1.print(',');
+  Serial1.print(PAYLOAD);   Serial1.print(',');
+  Serial1.print(pastDelay); Serial1.print('\n');
+  Serial1.flush();
+
+  // 2. receive
+  char rx[64];
+  int n = receiveMessage(rx, sizeof(rx));
+  unsigned long recvTime = millis();
+
+  // 3. compare — require correct LENGTH *and* exact content
+  bool matched = false;
+  if (n > 0) {
+    String expected = String(TIMESTAMP) + "," + PAYLOAD;
+    matched = (n == (int)expected.length()) && (expected == String(rx));
+    pastDelay = recvTime - sendTime;
+  }
+
+  // 4. debug
+  Serial.print("n="); Serial.print(n);
+  Serial.print(" rx=["); Serial.print(rx);
+  Serial.print("] matched="); Serial.println(matched);
+
+  // 5. confirm
+  blinkStatus(matched, 5000);
+}

@@ -1,0 +1,571 @@
+/* =============================================================================
+ *  BEFORE OPTIMIZATION
+ *  Group 4 - Laser Communication (PYNQ side)
+ *  Start UI (pages 1-3) + communication debug screen (page 4)
+ * -----------------------------------------------------------------------------
+ *  Behaviour matches PYNQCode.txt in this folder; only the comments differ.
+ *  The UART is 9600 baud (fixed in the FPGA bitstream, not changeable from C).
+ * -----------------------------------------------------------------------------
+ *  RX (Arduino -> PYNQ)  HARDWARE UART0, 9600 baud, 8N1, normal polarity.
+ *                        Message: timestamp,payload,pastdelay\n  (split on ',')
+ *
+ *  TX (PYNQ -> Arduino)  INVERTED 8N1 UART, bit-banged on A0 in software. Same
+ *                        framing as the inbound UART but REVERSED polarity:
+ *                        idle LOW, START HIGH, 8 data bits LSB-first (each
+ *                        inverted), STOP LOW(idle). '\n'-terminated.
+ *                        Sends "timestamp,payload\n" - the delay is NOT echoed.
+ *                        Each byte carries START+STOP, so the peer re-syncs per
+ *                        byte (no drift). Bit time = BIT_PERIOD_MS; the peer's
+ *                        decoder MUST use exactly the same slow bit period.
+ *
+ *  N (BTN2) = universal EXIT on every page.
+ * ===========================================================================*/
+
+#include <libpynq.h>     // pynq_init, gpio, uart, display, switchbox, sleep_msec
+#include <stdio.h>       // snprintf  (display functions are NOT printf)
+#include <string.h>      // strlen, strchr, memcpy
+#include <stdint.h>      // uint8_t, uint32_t
+#include <stdbool.h>     // bool
+#include <stdlib.h>      // atoi  (only used for the delay field)
+
+/* ---- Pin map -----------------------------------------------------------------
+ * Aliases, so a rewire is a one-line edit instead of a search-and-replace. */
+#define RX_PIN  IO_AR0          // data in: Arduino TX -> here (page-2 detect + UART0 RX)
+#define TX_PIN  IO_A0           // data out: bit-banged inverted reply -> Arduino D2
+
+#define BTN_Y  IO_BTN3          // "Yes"  / advance
+#define BTN_N  IO_BTN2          // "No"   / universal EXIT
+#define BTN_A  IO_BTN1          // "Again"/ go back to Connecting
+#define LED_Y  IO_LD3           // lights for Y
+#define LED_N  IO_LD2           // lights for N
+#define LED_A  IO_LD1           // lights for A
+
+/* ---- Display geometry -------------------------------------------------------
+ * 240 x 240 is the ENFORCED safe area, found by experiment, not a datasheet
+ * value. Going past it makes libpynq abort() the whole process. */
+#define DISPLAY_W   240
+#define DISPLAY_H   240
+#define FONT_W        8         // glyph width  -> about 30 characters per row
+#define FONT_H       16         // glyph height -> 14 usable rows
+#define MARGIN_X      5         // left margin for normal text
+#define TITLE_Y      25         // y of the green title on every page
+
+/* ---- Layout for the simple pages (1 and 3) ---------------------------------*/
+#define BODY_Y0      55         // y of the first body line (gap below title)
+#define BODY_DY      20         // line pitch between body lines
+
+/* ---- Row table for the page-4 debug screen --------------------------------*/
+#define Y_RX_HDR   50           // "Received Data:"     (red, centred)
+#define Y_RX_TS    72           // "Timestamp: ..."
+#define Y_RX_PL    92           // "Payload: ..."
+#define Y_RX_BITS 112           // "Bits: Data Bytes" / "Bits: Idle"
+#define Y_TX_HDR  140           // "Transmitted Data:"  (red, centred)
+#define Y_TX_TS   162
+#define Y_TX_PL   182
+#define Y_TX_BITS 202
+#define Y_FOOTER  222           // bottom row: EXIT (N) | Last Delay | page no.
+
+/* ---- Timing ---------------------------------------------------------------*/
+#define LOOP_MS               30   // button poll period on pages 1 and 3
+#define BLINK_MS             600   // LED blink half-period (on for 600, off 600)
+#define DETECT_SAMPLE_MS       5   // poll period while waiting for a first byte
+#define DOT_UPDATE_MS        400   // "Connecting..." dot animation step
+#define REQUIRED_TRANSITIONS   4   // DEAD CODE: leftover from the old GPIO
+                                   // edge-counting detector. Safe to delete.
+#define HOLD_MS             4000   // how long a finished message stays readable
+#define BIT_PERIOD_MS         10   // outbound bit time; peer decoder MUST match
+
+/* ---- Types ---------------------------------------------------------------*/
+typedef enum { ANS_NONE = 0, ANS_Y, ANS_N, ANS_A } answer_t;   // button meaning
+typedef enum { PAGE1, PAGE2_CONNECT, PAGE3_READY, PAGE4_COMM } state_t; // page
+
+/* =============================== shared helpers ============================*/
+
+/* safe_draw - the single most important function in this file.
+ *
+ * In : display, font, x, y, text, colour.   Out: nothing.
+ *
+ * libpynq's displayDrawChar calls abort() if any glyph would cross the screen
+ * edge, which kills the whole program. This wrapper makes that impossible:
+ * it drops rows that fall off the bottom, clamps a negative x, works out how
+ * many glyphs still fit to the right of x, and truncates the string.
+ * NOTHING in this file may call displayDrawString directly. */
+static void safe_draw(display_t *d, FontxFile *font, int x, int y,
+                      const char *text, uint16_t color)
+{
+    if (y < 0 || y + FONT_H > DISPLAY_H) return;   // row off screen -> skip it
+    if (x < 0) x = 0;                              // clamp into the screen
+    int max_chars = (DISPLAY_W - x) / FONT_W;      // how many glyphs still fit
+    if (max_chars <= 0) return;                    // nothing fits -> skip
+
+    char buf[48];
+    int n = (int)strlen(text);
+    if (n > max_chars)            n = max_chars;           // clip to the screen
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1; // clip to the buffer
+    memcpy(buf, text, n);
+    buf[n] = '\0';
+    displayDrawString(d, font, x, y, (uint8_t *)buf, color);
+}
+
+/* draw_centered - horizontally centre one line. Used for the two red page-4
+ * section headers. In: y, text, colour. Out: nothing. */
+static void draw_centered(display_t *d, FontxFile *font, int y,
+                          const char *text, uint16_t color)
+{
+    int x = (DISPLAY_W - (int)strlen(text) * FONT_W) / 2;
+    safe_draw(d, font, x, y, text, color);
+}
+
+/* Tiny GPIO wrappers, so the intent reads in plain English below.
+ * pressed()      -> true while the button is physically held.
+ * set_led()      -> drive one LED.
+ * all_leds_off() -> clear all three, so two can never be lit at once. */
+static bool pressed(int btn)          { return gpio_get_level(btn) == GPIO_LEVEL_HIGH; }
+static void set_led(int led, bool on) { gpio_set_level(led, on ? GPIO_LEVEL_HIGH : GPIO_LEVEL_LOW); }
+static void all_leds_off(void)        { set_led(LED_Y,false); set_led(LED_N,false); set_led(LED_A,false); }
+
+/* The exit hint. Called by every page, which is what makes EXIT universal. */
+static void draw_exit_footer(display_t *d, FontxFile *font)
+{
+    safe_draw(d, font, MARGIN_X, Y_FOOTER, "EXIT (N)", RGB_WHITE);
+}
+
+/* ============================= start-UI drawing ============================*/
+
+/* Page number, flush to the bottom-right corner. The x is computed from the
+ * string length so a two-digit page would still sit correctly. */
+static void draw_page_number(display_t *d, FontxFile *font, int page_no)
+{
+    char s[8];
+    snprintf(s, sizeof(s), "%d", page_no);
+    int x = DISPLAY_W - (int)strlen(s) * FONT_W - 2;
+    safe_draw(d, font, x, DISPLAY_H - FONT_H - 2, s, RGB_WHITE);
+}
+
+/* draw_page - renders any simple page in one call.
+ *
+ * In : green title, array of white body lines, how many lines, page number.
+ * Out: nothing.
+ *
+ * Pages 1 and 3 have no code of their own: they are just data passed in here. */
+static void draw_page(display_t *d, FontxFile *font,
+                      const char *title, const char *body[], int n_body, int page_no)
+{
+    displayFillScreen(d, RGB_BLACK);                            // clear
+    safe_draw(d, font, MARGIN_X, TITLE_Y, title, RGB_GREEN);    // title
+    for (int i = 0; i < n_body; i++)                            // body lines
+        safe_draw(d, font, MARGIN_X, BODY_Y0 + i * BODY_DY, body[i], RGB_WHITE);
+    draw_exit_footer(d, font);                                  // EXIT (N)
+    draw_page_number(d, font, page_no);                         // page digit
+}
+
+/* wait_for_answer - block until the user answers.
+ *
+ * In : allowY, allowA - which options this page actually offers.
+ * Out: which answer was given (N is always accepted).
+ *
+ * Visual contract: an LED BLINKING means "this option is offered and I am
+ * waiting"; an LED SOLID means "your press is registered". */
+static answer_t wait_for_answer(bool allowY, bool allowA)
+{
+    bool blink_on = false;
+    uint32_t elapsed = 0;
+
+    for (;;)
+    {
+        int btn = 0, led = 0;
+        answer_t ans = ANS_NONE;
+
+        /* N first: EXIT always wins over the other options. */
+        if      (pressed(BTN_N))           { ans = ANS_N; btn = BTN_N; led = LED_N; }
+        else if (allowY && pressed(BTN_Y)) { ans = ANS_Y; btn = BTN_Y; led = LED_Y; }
+        else if (allowA && pressed(BTN_A)) { ans = ANS_A; btn = BTN_A; led = LED_A; }
+
+        if (ans != ANS_NONE)
+        {
+            all_leds_off();
+            set_led(led, true);                      // solid while held
+            while (pressed(btn)) sleep_msec(10);     // wait for release = debounce
+            set_led(led, false);
+            return ans;
+        }
+
+        /* Nothing pressed: blink the LEDs of the offered options together. */
+        if (elapsed >= BLINK_MS) { blink_on = !blink_on; elapsed = 0; }
+        set_led(LED_Y, allowY && blink_on);
+        set_led(LED_A, allowA && blink_on);
+        set_led(LED_N, blink_on);                    // N is always offered
+        sleep_msec(LOOP_MS);
+        elapsed += LOOP_MS;
+    }
+}
+
+/* Page 2 frame: "Connecting" plus 1, 2 or 3 red dots. The dots are padded with
+ * spaces to a fixed width so the text does not jitter as it animates. */
+static void draw_connecting(display_t *d, FontxFile *font, int dots)
+{
+    char line[16] = "Connecting";
+    for (int i = 0; i < 3; i++) line[10 + i] = (i < dots) ? '.' : ' ';
+    line[13] = '\0';
+
+    displayFillScreen(d, RGB_BLACK);
+    safe_draw(d, font, MARGIN_X, TITLE_Y, line, RGB_RED);
+    draw_exit_footer(d, font);
+    draw_page_number(d, font, 2);
+}
+
+/* wait_for_signal - page 2. Wait until the link proves itself.
+ *
+ * In : display, font.   Out: true if the user pressed EXIT, false if data came.
+ *
+ * "Connected" is defined as: the UART receiver has latched at least one byte.
+ * This is why the FIFO matters - a whole 27 ms message can land while this
+ * loop is asleep and it is still detected. The earlier approach of counting
+ * GPIO edges every 5 ms could not see a short burst at all. */
+static bool wait_for_signal(display_t *d, FontxFile *font)   // true = EXIT
+{
+    switchbox_set_pin(RX_PIN, SWB_UART0_RX);   // route AR0 to the UART receiver
+    uart_reset_fifos(UART0);                   // drop stale bytes -> no false hit
+
+    int dots = 1;
+    uint32_t anim = 0, blink_t = 0;
+    bool blink_on = false;
+
+    all_leds_off();
+    draw_connecting(d, font, dots);
+
+    while (!uart_has_data(UART0))               // connected once ANY byte arrives
+    {
+        /* EXIT check, with wait-for-release so one press is one action. */
+        if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10); set_led(LED_N, false); return true; }
+
+        if (anim >= DOT_UPDATE_MS) { dots = (dots % 3) + 1; draw_connecting(d, font, dots); anim = 0; }
+        if (blink_t >= BLINK_MS)   { blink_on = !blink_on; set_led(LED_N, blink_on); blink_t = 0; }
+
+        sleep_msec(DETECT_SAMPLE_MS);           // keep the CPU free
+        anim    += DETECT_SAMPLE_MS;            // software timers
+        blink_t += DETECT_SAMPLE_MS;
+    }
+    set_led(LED_N, false);
+    return false;                               // -> page 3
+}
+
+/* ====================== message parsing (split on ',') =====================*/
+
+/* copy_field - copy the half-open range [start,end) into dst.
+ *
+ * Out: nothing; dst is filled and NUL terminated.
+ * Skips leading spaces (so "a, b" parses like "a,b") and clamps to cap-1.
+ * This single clamp is what keeps every caller safe from overruns. */
+static void copy_field(char *dst, int cap, const char *start, const char *end)
+{
+    while (start < end && *start == ' ') start++;       // tolerate optional space
+    int n = (int)(end - start);
+    if (n < 0) n = 0;
+    if (n > cap - 1) n = cap - 1;                      // never overrun dst
+    memcpy(dst, start, n);
+    dst[n] = '\0';
+}
+
+/* split_fields - cut "timestamp,payload,pastdelay" into three strings.
+ *
+ * In : the whole message, plus three (buffer, capacity) pairs.
+ * Out: nothing; ts, pl and dl are filled.
+ *
+ * Missing commas are not an error - the absent fields come back empty, so a
+ * two-field message still parses. */
+static void split_fields(const char *msg, char *ts, int tc, char *pl, int pc, char *dl, int dc)
+{
+    const char *end = msg + strlen(msg);
+    const char *c1 = strchr(msg, ',');                 // first comma
+    const char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;  // second comma
+
+    copy_field(ts, tc, msg, c1 ? c1 : end);                        // field 1
+    if (c1) copy_field(pl, pc, c1 + 1, c2 ? c2 : end); else pl[0] = '\0';  // 2
+    if (c2) copy_field(dl, dc, c2 + 1, end);           else dl[0] = '\0';  // 3
+}
+
+/* make_reply - build what gets echoed back: "timestamp,payload".
+ *
+ * In : the received message, an output buffer and its capacity.
+ * Out: nothing; reply is filled.
+ *
+ * It copies the RAW bytes from the start up to the second comma rather than
+ * re-joining the parsed fields, which guarantees the echo is byte-identical to
+ * what arrived. With no second comma it copies to the end of the string, so it
+ * already works unchanged if the peer stops sending the delay field. */
+static void make_reply(const char *msg, char *reply, int cap)
+{
+    const char *c1 = strchr(msg, ',');
+    const char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+    const char *end = c2 ? c2 : msg + strlen(msg);     // cut at 2nd comma or end
+    int n = (int)(end - msg);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(reply, msg, n);
+    reply[n] = '\0';
+}
+
+/* ===================== inverted 8N1 UART transmit (software) ================*/
+
+/* uart_send_inverted - clock a string out of A0 as inverted 8N1 UART.
+ *
+ * In : the string to send (already '\n'-terminated). Out: nothing. Drives A0.
+ *
+ * Reversed-polarity UART, 10 bits per character:
+ *     bit 1     START   = HIGH                  (UART's start bit is LOW)
+ *     bits 2-9  8 data bits, LSB first, INVERTED (UART data is non-inverted)
+ *     bit 10    STOP    = LOW (= idle)          (UART's stop bit is HIGH)
+ * Idle level is LOW, the inverse of UART's idle HIGH.
+ *
+ * Same framing as the inbound hardware UART, just inverted. Because every byte
+ * ends in a STOP/idle bit, the peer sees a fresh idle->START edge on every byte
+ * and re-synchronises per byte, so the slow link does not accumulate drift.
+ * It is still not readable by a hardware UART receiver: the inverted idle alone
+ * would look like a permanent break, so the peer decodes it in software and
+ * inverts every sample.
+ *
+ * BLOCKING and timing-critical. One level per sleep_msec(BIT_PERIOD_MS), so a
+ * 23-character reply takes about 2.3 s, during which nothing else may run - no
+ * LCD writes, no LED updates - or the bit timing is destroyed.
+ * 10 ms per bit is not a style choice: this is Linux userspace, sleep_msec has
+ * 1 ms resolution and the scheduler can preempt for longer than one bit at any
+ * real baud rate. Only millisecond-scale bit periods are reliable here. */
+static void uart_send_inverted(const char *s)
+{
+    gpio_set_level(TX_PIN, 0);                          // idle LOW, one bit long
+    sleep_msec(BIT_PERIOD_MS);
+
+    for (int i = 0; s[i] != '\0'; i++)
+    {
+        unsigned char ch = (unsigned char)s[i];
+
+        gpio_set_level(TX_PIN, 1);                      // START = HIGH (inverted)
+        sleep_msec(BIT_PERIOD_MS);
+
+        for (int b = 0; b < 8; b++)                     // 8 data bits, LSB first
+        {
+            int bit = (ch >> b) & 1;
+            gpio_set_level(TX_PIN, bit ? 0 : 1);        // inverted on the wire
+            sleep_msec(BIT_PERIOD_MS);
+        }
+
+        gpio_set_level(TX_PIN, 0);                      // STOP = LOW (= idle)
+        sleep_msec(BIT_PERIOD_MS);
+    }
+    gpio_set_level(TX_PIN, 0);                          // remain idle LOW
+}
+
+/* ============================ comm-screen drawing ==========================*/
+
+/* hold_or_exit - keep the current screen readable for ms milliseconds.
+ *
+ * In : how long to hold.   Out: true if EXIT was pressed during the hold.
+ *
+ * Implements the "a finished message stays on screen for 4 s" requirement
+ * while still polling BTN2 and blinking LD2.
+ * NOTE: it does NOT read the UART. Together with the ~2 s transmit, the program
+ * is deaf for about 6 s after each message, which is fine only because the peer
+ * pauses between messages. See HANDOFF_PYNQ.txt section 8.3 for the
+ * drain-while-holding version needed for a continuous stream. */
+static bool hold_or_exit(int ms)
+{
+    uint32_t blink_t = 0; bool on = false;
+    for (int t = 0; t < ms; t++)
+    {
+        if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10); set_led(LED_N, false); return true; }
+        if (++blink_t >= BLINK_MS) { on = !on; set_led(LED_N, on); blink_t = 0; }
+        sleep_msec(1);                                  // 1 ms granularity
+    }
+    return false;
+}
+
+/* draw_comm_screen - render the whole page-4 debug screen.
+ *
+ * In : the parsed timestamp and payload, the last delay in ms, and two flags
+ *      saying whether each direction is currently moving data.
+ * Out: nothing.
+ *
+ * The transmitted rows show the same ts and pl as the received rows on purpose:
+ * the reply is a verbatim echo of exactly those two fields. */
+static void draw_comm_screen(display_t *d, FontxFile *font,
+                             const char *ts, const char *pl, int last_delay,
+                             bool rx_active, bool tx_active)
+{
+    char line[48];                                      // snprintf scratch
+    displayFillScreen(d, RGB_BLACK);
+
+    safe_draw(d, font, MARGIN_X, TITLE_Y, "Communication", RGB_GREEN);   // title
+
+    /* ---- what came IN on AR0 ---- */
+    draw_centered(d, font, Y_RX_HDR, "Received Data:", RGB_RED);
+    snprintf(line, sizeof(line), "Timestamp: %s", ts);  safe_draw(d, font, MARGIN_X, Y_RX_TS, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Payload: %s", pl);    safe_draw(d, font, MARGIN_X, Y_RX_PL, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Bits: %s", rx_active ? "Data Bytes" : "Idle");
+    safe_draw(d, font, MARGIN_X, Y_RX_BITS, line, RGB_WHITE);
+
+    /* ---- what went OUT on A0 ---- */
+    draw_centered(d, font, Y_TX_HDR, "Transmitted Data:", RGB_RED);
+    snprintf(line, sizeof(line), "Timestamp: %s", ts);  safe_draw(d, font, MARGIN_X, Y_TX_TS, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Payload: %s", pl);    safe_draw(d, font, MARGIN_X, Y_TX_PL, line, RGB_WHITE);
+    snprintf(line, sizeof(line), "Bits: %s", tx_active ? "Data Bytes" : "Idle");
+    safe_draw(d, font, MARGIN_X, Y_TX_BITS, line, RGB_WHITE);
+
+    /* ---- bottom row:  EXIT (N)  |  Last Delay:NNNN  |  4 ---- */
+    draw_exit_footer(d, font);                                           // left
+    snprintf(line, sizeof(line), "Last Delay:%04d", last_delay);         // 4 digits, ms
+    safe_draw(d, font, 90, Y_FOOTER, line, RGB_WHITE);                   // middle
+    safe_draw(d, font, DISPLAY_W - FONT_W - 2, Y_FOOTER, "4", RGB_WHITE);// right
+}
+
+/* ================================== page 4 =================================*/
+
+/* communication_screen - the heart of the program.
+ *
+ * In : display, font.   Out: nothing; returns only when EXIT is pressed.
+ *
+ * Receives a '\n'-terminated line on AR0 over the hardware UART, shows its
+ * fields, echoes "timestamp,payload" back out of A0 with the custom inverted
+ * bit-bang, then freezes the screen for HOLD_MS so it can be read. */
+void communication_screen(display_t *d, FontxFile *font)
+{
+    /* ---- configure the two pins for their two very different jobs ---- */
+    switchbox_set_pin(RX_PIN, SWB_UART0_RX);   // AR0 = hardware UART RX @ 9600
+    switchbox_set_pin(TX_PIN, SWB_GPIO);       // A0  = plain GPIO for bit-banging
+    gpio_set_direction(TX_PIN, GPIO_DIR_OUTPUT);
+    gpio_set_level(TX_PIN, 0);                 // inverted idle = LOW
+    uart_reset_fifos(UART0);                   // start from a clean receiver
+
+    char msg[128]; int len = 0;                // line assembly buffer
+    char ts[32] = "", pl[48] = "", dl[16] = "", reply[96];
+    int last_delay = 0;                        // peer's round-trip time, ms
+    uint32_t blink_t = 0; bool blink_on = false;
+
+    draw_comm_screen(d, font, ts, pl, last_delay, false, false);   // idle screen
+
+    for (;;)
+    {
+        /* 1. EXIT always has priority. */
+        if (pressed(BTN_N)) { while (pressed(BTN_N)) sleep_msec(10); set_led(LED_N, false); return; }
+
+        /* 2. Keep the exit hint alive. */
+        if (blink_t >= BLINK_MS) { blink_on = !blink_on; set_led(LED_N, blink_on); blink_t = 0; }
+
+        /* 3. Service the UART, one byte per iteration. */
+        if (uart_has_data(UART0))
+        {
+            uint8_t c = uart_recv(UART0);               // standard UART, 9600 8N1
+
+            if (c == '\r') continue;                    // ignore CR: CRLF and LF both work
+
+            if (c == '\n')                              /* ---- end of message ---- */
+            {
+                if (len == 0) continue;                 // ignore an empty line
+                msg[len] = '\0';
+
+                /* parse the three comma-separated fields */
+                split_fields(msg, ts, sizeof ts, pl, sizeof pl, dl, sizeof dl);
+                if (dl[0]) last_delay = atoi(dl);       // keep the old value if absent
+
+                /* build the echo: timestamp + payload, delay dropped, then
+                 * append the '\n' terminator the peer's UART decoder expects */
+                make_reply(msg, reply, sizeof reply);
+                {
+                    size_t rl = strlen(reply);
+                    if (rl < sizeof(reply) - 1) { reply[rl] = '\n'; reply[rl + 1] = '\0'; }
+                }
+
+                /* show both directions ACTIVE before the slow transmit, because
+                 * the screen cannot be touched again until it finishes */
+                draw_comm_screen(d, font, ts, pl, last_delay, true, true);
+
+                uart_send_inverted(reply);              // ~2.3 s, blocking
+
+                draw_comm_screen(d, font, ts, pl, last_delay, false, false);   // idle
+                if (hold_or_exit(HOLD_MS)) { set_led(LED_N, false); return; }  // 4 s freeze
+
+                len = 0;                                // ready for the next line
+            }
+            else                                        /* ---- a data byte ---- */
+            {
+                /* first byte of a new message -> flip the RX status to
+                 * "Data Bytes" so the screen shows traffic arriving */
+                if (len == 0) draw_comm_screen(d, font, ts, pl, last_delay, true, false);
+
+                if (len < (int)sizeof(msg) - 1) msg[len++] = (char)c;   // overflow guard
+            }
+        }
+        else
+        {
+            sleep_msec(1);                              // nothing to do
+            blink_t += 1;                               // advance the blink timer
+        }
+    }
+}
+
+/* =================================== main ==================================*/
+
+int main(void)
+{
+    /* ---- bring up the board ---- */
+    pynq_init();
+    gpio_init();
+    uart_init(UART0);                 // 9600 8N1, FIXED in the FPGA bitstream.
+                                      // There is no baud argument and no way to
+                                      // change it from C - the peer must match.
+
+    /* ---- bring up the LCD and load the font ---- */
+    display_t display;
+    display_init(&display);
+    FontxFile font[2];
+    InitFontx(font, "../../fonts/ILGH16XB.FNT", "");   // path is relative to the
+                                                       // run directory
+    displaySetFontDirection(&display, TEXT_DIRECTION0);
+
+    /* ---- buttons are inputs, LEDs are outputs ---- */
+    gpio_set_direction(BTN_Y, GPIO_DIR_INPUT);
+    gpio_set_direction(BTN_N, GPIO_DIR_INPUT);
+    gpio_set_direction(BTN_A, GPIO_DIR_INPUT);
+    gpio_set_direction(LED_Y, GPIO_DIR_OUTPUT);
+    gpio_set_direction(LED_N, GPIO_DIR_OUTPUT);
+    gpio_set_direction(LED_A, GPIO_DIR_OUTPUT);
+    all_leds_off();
+
+    /* ---- the page state machine. State changes come ONLY from a button press
+     *      or from the arrival of serial data. ---- */
+    state_t state = PAGE1;
+
+    for (;;)
+    {
+        if (state == PAGE1)
+        {
+            const char *body[] = { "Ready for Connection? (Y)" };
+            draw_page(&display, font, "Hello Universe.", body, 1, 1);
+            if (wait_for_answer(true, false) == ANS_Y) state = PAGE2_CONNECT;
+            else                                       state = PAGE1;  // N stays put
+        }
+        else if (state == PAGE2_CONNECT)
+        {
+            if (wait_for_signal(&display, font)) state = PAGE1;        // EXIT
+            else                                 state = PAGE3_READY;  // byte seen
+        }
+        else if (state == PAGE3_READY)
+        {
+            const char *body[] = { "Proceed to", "Communication? (Y/A)" };
+            draw_page(&display, font, "Ready for Communication", body, 2, 3);
+            answer_t a = wait_for_answer(true, true);
+            if      (a == ANS_Y) state = PAGE4_COMM;      // start communicating
+            else if (a == ANS_A) state = PAGE2_CONNECT;   // reconnect
+            else                 state = PAGE1;          // EXIT
+        }
+        else if (state == PAGE4_COMM)
+        {
+            communication_screen(&display, font);         // returns on EXIT only
+            state = PAGE1;
+        }
+    }
+
+    /* Unreachable: the loop above never breaks. Kept to document the intended
+     * teardown if a quit path is ever added. */
+    pynq_destroy();
+    return 0;
+}
